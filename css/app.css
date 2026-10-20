@@ -77,7 +77,7 @@ p { margin: 0; }
 *::-webkit-scrollbar { display: none; width: 0; height: 0; }
 
 /* ---- Mise en page : plan en haut, panneau en bas (portrait) --------------------------------- */
-#map { position: fixed; left: 0; right: 0; top: 0; height: 40vh; height: 40dvh; z-index: 0; background: var(--surface-2); }
+#map { position: fixed; left: 0; right: 0; top: 0; height: 40vh; height: 40dvh; z-index: 0; background: #F2EFE9; }   /* teinte des fonds de carte (pas de bande sombre si le dessin a un temps de retard) */
 #panel { position: fixed; left: 0; right: 0; bottom: 0; top: calc(40vh - 20px); top: calc(40dvh - 20px);
   overflow-y: auto; overscroll-behavior: contain; background: var(--panel-bg);
   -webkit-backdrop-filter: var(--glass-filter); backdrop-filter: var(--glass-filter); display: flex; flex-direction: column; gap: 14px;
@@ -89,12 +89,16 @@ p { margin: 0; }
 .handle::before { content: ""; position: absolute; left: 50%; top: 11px; width: 48px; height: 6px; margin-left: -24px; border-radius: 3px;
   background: var(--line); opacity: .7; }
 .sheet-head { touch-action: none; user-select: none; -webkit-user-select: none; }
-body.full #map { display: none; }
+body.full #map { visibility: hidden; pointer-events: none; }   /* (pas display: none : une carte de taille nulle cassait le fond vectoriel) */
 /* Recherche et choix d'itinéraire : le plan occupe tout l'écran, SOUS le panneau en verre ;
    le panneau prend la hauteur de son contenu et se réduit d'un glissement (voir layoutSheet) */
 body.sheet #map { height: 100vh; height: 100dvh; }
 body.sheet #panel { top: auto; min-height: 50vh; min-height: 50dvh; max-height: calc(100vh - 96px - var(--safe-top)); max-height: calc(100dvh - 96px - var(--safe-top));
   transform: translateY(var(--sheet-y, 0px)); transition: transform .3s cubic-bezier(.2, .8, .2, 1); }
+/* Une longue liste d'itinéraires ne recouvre plus la carte : le panneau s'arrête à 58 % de l'écran et sa liste
+   défile dedans (la carte et le trajet restent visibles au-dessus). Pendant la saisie d'une adresse, il reprend
+   toute la hauteur pour les suggestions. */
+body.sheet:not(.typing) #panel { max-height: min(calc(100vh - 96px - var(--safe-top)), 58vh); max-height: min(calc(100dvh - 96px - var(--safe-top)), 58dvh); }
 body.sheet.dragging #panel { transition: none; }
 /* Panneau abaissé : la poignée et le titre seulement ; le reste s'efface au lieu d'être coupé */
 body.sheet #panel > :not(.sheet-head) { transition: opacity .2s ease; }
@@ -292,7 +296,7 @@ input[type=range] { width: 100%; accent-color: var(--primary); height: 32px; }
 }
 
 /* ---- Carte : repères, popups, légende ------------------------------------------------------------ */
-.leaflet-container { font: inherit; background: var(--surface-2); }
+.leaflet-container { font: inherit; background: #F2EFE9; }
 .leaflet-popup-content-wrapper { border-radius: 14px; box-shadow: var(--shadow); }
 .leaflet-popup-content { margin: 12px 14px; }
 .pp { min-width: 190px; font-size: 14px; color: #0F2537; }
@@ -339,11 +343,11 @@ body .leaflet-control-attribution { display: none; }
 .map-credits .leaflet-attribution-flag { display: none !important; }   /* petit drapeau de Leaflet : inutile ici */
 body.full .map-credits { display: none; }
 /* le bas du panneau laisse la place à la bande */
-body:not(.full) #panel { padding-bottom: calc(var(--gutter) + var(--safe-bottom) + 24px); }
+body:not(.full) #panel { padding-bottom: calc(var(--gutter) + var(--safe-bottom) + 24px + var(--vp-gap)); }
 body.sheet::after { display: none; }
 @media (orientation: landscape) and (max-height: 600px), (min-width: 768px) and (min-height: 601px) {
   .map-credits { left: var(--side); border-top: 0; border-radius: 8px 0 0 0; background: color-mix(in srgb, var(--bg) 85%, transparent); }
-  body:not(.full) #panel { padding-bottom: calc(var(--gutter) + var(--safe-bottom)); }
+  body:not(.full) #panel { padding-bottom: calc(var(--gutter) + var(--safe-bottom) + var(--vp-gap)); }
 }
 /* carte du dôme (guidage) : la mention reste en bas, dans la partie visible */
 #ar .leaflet-top.leaflet-right { top: auto; bottom: 0; }
@@ -457,6 +461,16 @@ html.native-ar-on, html.native-ar-on body { background: transparent !important; 
 /* fond opaque : jamais de « trou » vers la caméra pendant le chargement des tuiles */
 #ar .dome-map { background: #E4E9ED; }
 #ar .dome-map > #map { background: #E4E9ED; }
+/* Mini-carte orientée dans le sens de la marche (comme un GPS de voiture) : la carte tourne avec la boussole,
+   agrandie pour que les coins restent couverts ; icônes et point de position restent droits. En grand : nord en haut. */
+#ar:not(.map-full) .dome-map > #map { inset: -30% !important; width: 160% !important; height: 160% !important;
+  rotate: calc(-1 * var(--heading, 0deg)); }
+#ar:not(.map-full) .dome-map .leaflet-marker-icon > * { rotate: var(--heading, 0deg); }
+#ar:not(.map-full) .dome-map .puck .cone { transform: none; }
+#ar:not(.map-full) .dome-map .leaflet-control-container { display: none; }
+#ar .dome-credit { position: absolute; z-index: 3; left: 0; right: 0; text-align: center; font-size: 10px; color: rgba(15, 37, 55, .7);
+  bottom: calc(74px + var(--safe-bottom) * .5 + var(--vp-gap)); pointer-events: none; text-shadow: 0 0 3px #fff; }
+#ar.map-full .dome-credit, #ar.native-ar .dome-credit { display: none; }
 #ar .ring { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
 /* Poignée posée au sommet de l'anneau : tirer vers le haut / le bas (cible tactile de 44 px) */
 #ar .dome-grip { position: absolute; left: 50%; top: 0; width: 88px; height: 44px; margin-left: -44px; border: 0; background: transparent;
@@ -582,6 +596,10 @@ body:not(.sheet) .map-settings { display: none; }
 .confirm-box { width: min(440px, 100%); border-radius: 24px; padding: 18px; display: flex; flex-direction: column; gap: 14px;
   background: var(--surface-solid); color: var(--ink); box-shadow: var(--shadow); }
 .confirm-box h3 { color: var(--primary); }
+.loc-help ol { margin: 0; padding-left: 22px; display: flex; flex-direction: column; gap: 8px; font-size: 16px; line-height: 1.35; }
+.loc-help ol b { color: var(--primary); }
+#ar .banner-btn { width: 100%; text-align: left; font: inherit; cursor: pointer; display: flex; align-items: center; gap: 10px; }
+#ar .banner-btn > span { flex: 1; }
 
 /* ---- Authentification : Bienvenue, Connexion, Inscription (d'après la maquette) ----------------- */
 body.auth-screen #panel { padding: 0; gap: 0; background: var(--bg); }
@@ -781,6 +799,15 @@ body.auth-screen #panel { padding: 0; gap: 0; background: var(--bg); }
 :root { --vp-gap: 0px; }
 #panel, body.sheet::after, .map-credits, #hud, #ar, .confirm, #loader, .stk-pop { bottom: calc(-1 * var(--vp-gap)); }
 body.sheet #map, body.nav #map { height: calc(100vh + var(--vp-gap)); height: calc(100dvh + var(--vp-gap)); }
+/* Le fond va jusqu'au bord, mais les COMMANDES restent au-dessus de cette rallonge : selon la version d'iOS, la
+   bande prolongée n'est pas toujours affichée, et la barre du guidage était coupée à moitié (retour du 19/10). */
+#ar .dock { bottom: calc(6px + var(--safe-bottom) * .5 + var(--vp-gap)); }
+#ar .sheet { bottom: calc(8px + var(--safe-bottom) + var(--vp-gap)); }
+#ar .rose { bottom: calc(88px + var(--safe-bottom) + var(--vp-gap)); }
+#ar .leaflet-bottom { margin-bottom: calc(70px + var(--safe-bottom) * .5 + var(--vp-gap)); }
+#ar .dome, #ar .dome-ui { height: calc(min(36vh, 330px) + var(--safe-bottom) + var(--vp-gap)); }
+.map-credits { padding-bottom: var(--vp-gap); }
+body.full #panel { padding-bottom: calc(var(--gutter) + var(--safe-bottom) + var(--vp-gap)); }
 
 /* ---- Plus de transparence quand le plan est derrière le panneau (recherche, itinéraires, guidage) ---------- */
 body.sheet #panel, body.nav #panel { -webkit-backdrop-filter: blur(14px) saturate(1.6); backdrop-filter: blur(14px) saturate(1.6); }
@@ -832,3 +859,60 @@ body.sheet .trip, body.sheet .places, body.sheet .rcard, body.sheet .icon-btn { 
 .arrive-card li.bad span { font-weight: 700; }
 .arrive-card li.info .i { color: var(--muted); }
 .arrive-card .fine { margin: 0; }
+
+/* ---- Animation d'entrée (render() : seulement pour un élément dont la clé data-key est nouvelle) ---- */
+.enter { animation: va-enter .28s cubic-bezier(.2, .8, .3, 1) both; }
+@keyframes va-enter { from { opacity: 0; transform: translateY(8px); } }
+@media (prefers-reduced-motion: reduce) { .enter { animation: none; } }
+
+/* Point « vous êtes ici » sur la carte de recherche */
+.here-dot { width: 22px; height: 22px; border-radius: 50%; background: #2F80ED; border: 4px solid #fff;
+  box-shadow: 0 0 0 6px rgba(47, 128, 237, .22), 0 2px 6px rgba(15, 37, 55, .4); }
+/* Fin de trajet : écran d'arrivée, puis fondu de la vue caméra */
+#ar .arrive-panel { position: absolute; z-index: 9; left: calc(12px + var(--safe-left)); right: calc(12px + var(--safe-right));
+  bottom: calc(86px + var(--safe-bottom) * .5 + var(--vp-gap)); max-width: 520px; margin: 0 auto; padding: 22px 18px 18px;
+  border-radius: 26px; background: var(--surface-solid); color: var(--ink); box-shadow: var(--shadow); text-align: center;
+  display: flex; flex-direction: column; align-items: center; gap: 6px; animation: arr-in .5s cubic-bezier(.2, 1.2, .4, 1) both; }
+#ar .arrive-flag { width: 58px; height: 58px; border-radius: 50%; display: grid; place-items: center; background: #C92A2A; color: #fff;
+  box-shadow: 0 0 0 8px rgba(201, 42, 42, .18); margin-top: -50px; }
+#ar .arrive-flag .i { width: 28px; height: 28px; }
+#ar .arrive-panel h3 { font-size: 22px; color: var(--primary); }
+#ar .arrive-dest { font-weight: 700; font-size: 16px; }
+#ar .arrive-sum { color: var(--muted); font-size: 14px; }
+#ar .arrive-actions { display: flex; gap: 10px; width: 100%; margin-top: 8px; }
+#ar .arrive-actions .btn { flex: 1; min-height: 50px; }
+@keyframes arr-in { from { opacity: 0; transform: translateY(30px) scale(.96); } }
+#ar.leaving { opacity: 0; transition: opacity .45s ease; }
+@media (prefers-reduced-motion: reduce) { #ar .arrive-panel { animation: none; } #ar.leaving { transition: none; } }
+
+/* Entrée de la destination : où mène l'itinéraire, et « Indiquer l'entrée » */
+.door-card { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 16px; background: var(--surface-2); }
+.door-card > .i { color: var(--primary); flex: none; }
+.door-card b { display: block; font-size: 15px; }
+.door-card small { color: var(--muted); font-size: 13px; }
+.door-card .btn.small { width: auto; flex: none; min-height: 38px; padding: 0 12px; font-size: 14px; }
+body.picking-door #map { cursor: crosshair; }
+body.picking-door #panel { opacity: .55; pointer-events: none; }
+
+/* Repères de la carte : équipements d'accessibilité (carré bleu PMR) et établissements (rond de couleur) */
+.mk { position: relative; width: 30px; height: 30px; display: grid; place-items: center; color: #fff; border: 2px solid #fff;
+  box-shadow: 0 2px 6px rgba(15, 37, 55, .35); box-sizing: border-box; }
+.mk > .i { width: 16px; height: 16px; stroke-width: 2.2; }
+.mk-erp { border-radius: 50%; background: var(--c); }
+.mk-infra { border-radius: 8px; background: #1D5FAF; }
+.mk-mini { width: 22px; height: 22px; border-radius: 6px; border-width: 1.5px; }
+.mk-mini > .i { width: 12px; height: 12px; }
+.mk-acc { position: absolute; right: -6px; bottom: -6px; width: 16px; height: 16px; border-radius: 50%; border: 2px solid #fff;
+  display: grid; place-items: center; color: #fff; font: 900 10px/1 system-ui, sans-serif; box-sizing: border-box; }
+.mk-acc .i { width: 9px; height: 9px; stroke-width: 4; }
+.mk-acc.ok { background: #0E9F5B; }
+.mk-acc.steps { background: #B42318; }
+.mk-dot { width: 12px; height: 12px; border-radius: 50%; background: var(--c); border: 2px solid #fff; box-sizing: border-box;
+  box-shadow: 0 1px 3px rgba(15, 37, 55, .45); }
+.mk-transit { border-radius: 50%; background: var(--c); }
+
+/* Attente d'une position sûre avant de calculer le trajet */
+.msg.locating { display: flex; gap: 10px; align-items: flex-start; padding: 12px 14px; border-radius: 16px; background: var(--surface-2); }
+.msg.locating > .i { color: #2F80ED; flex: none; animation: loc-pulse 1.4s ease-in-out infinite; }
+@keyframes loc-pulse { 50% { opacity: .35; transform: scale(.9); } }
+@media (prefers-reduced-motion: reduce) { .msg.locating > .i { animation: none; } }

@@ -10,7 +10,9 @@ import {icon} from "./icons.js";
 import {CONSIGNE, DANGER, INFO, makeSpeech} from "./speech.js";
 import {FEATURES} from "./features.js";
 import {sticker, stickerPop} from "./stickers.js";
-import {arrivalFiche, arrivalSpeech, entranceFor, loadAcces} from "./arrival.js";
+import {arrivalFiche, arrivalSpeech, entranceFor, erpList, loadAcces} from "./arrival.js";
+import {entranceAccess, erpCategory} from "./categories.js";
+import {ORIGIN_RULES, decideOrigin, distM, originValid} from "./origin.js";
 import {computeRoutes, loadNetwork, nearestNode, RoutingError, SNAP_MAX_DISTANCE_M, haversineM, resolveProfile} from "./routing.js";
 
 const MOB = [["manual_wheelchair", "Fauteuil roulant manuel", "accessibility"], ["electric_wheelchair", "Fauteuil électrique", "wheelchair-electric"],
@@ -50,7 +52,7 @@ const saved = store.get("va-profile", null);
 const S = {
   screen: !currentSession() ? "welcome" : saved ? "route" : "profile",
   mobilities: new Set(saved?.mobilities || ["manual_wheelchair"]), maxSlope: saved?.maxSlope ?? null, steps: saved?.steps ?? false,
-  voice: store.get("va-voice", true), haptics: store.get("va-haptics", true), stopsVoice: store.get("va-stops-voice", false), detect: store.get("va-detect", false), detectDebug: store.get("va-detect-debug", false),
+  voice: store.get("va-voice", true), haptics: store.get("va-haptics", true), stopsVoice: store.get("va-stops-voice", false), detect: store.get("va-detect", true), detectDebug: store.get("va-detect-debug", false),
   dataConsent: store.get("va-data-consent", false), autoLowConf: store.get("va-auto-lowconf", false), origin: {...MAIRIE}, dest: null, query: "", places: [],
   // départ : position GPS par défaut (comme Citymapper) ; searchFor « origin » quand on modifie le départ
   originMode: "auto", searchFor: "dest", oquery: "",
@@ -187,7 +189,7 @@ const BASEMAPS = {
   ign: {label: "Plan IGN", sub: "Carte officielle française, lisible et sobre",
         url: IGN_WMTS("GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2&STYLE=normal&FORMAT=image/png"), maxZoom: 19, attribution: "© IGN · réseau © OpenStreetMap"},
   ortho: {label: "Photos aériennes", sub: "Vue du ciel (IGN), comme le mode satellite",
-          url: IGN_WMTS("ORTHOIMAGERY.ORTHOPHOTOS&STYLE=normal&FORMAT=image/jpeg"), maxZoom: 19, attribution: "Photos © IGN · réseau © OpenStreetMap"},
+          url: IGN_WMTS("ORTHOIMAGERY.ORTHOPHOTOS&STYLE=normal&FORMAT=image/jpeg"), maxZoom: 19, attribution: "Photos © IGN · réseau © OpenStreetMap", bg: "#5B6450"},
   // Fonds vectoriels OpenFreeMap : gratuits, sans clé ni limite ; affichés par MapLibre, chargé seulement si choisi
   liberty: {label: "Style Plans", sub: "Clair et coloré, proche de Plans (Apple) et de Google Maps",
             style: "https://tiles.openfreemap.org/styles/liberty", attribution: `<a href="https://openfreemap.org">OpenFreeMap</a> · © OpenMapTiles · ${OSM_ATTR}`},
@@ -237,6 +239,9 @@ async function setBasemap(key) {
   ctl._update?.();
   baseLayer = layer.addTo(map);
   baseLayer.bringToBack?.();
+  // Sous le fond de carte, la couleur du fond de carte : un instant de retard au dessin (zoom, déplacement rapide,
+  // tuile qui arrive) ne laisse plus voir de bande sombre, seulement la teinte de la carte
+  $("map").style.background = b.bg || "#F2EFE9";
 }
 // Le plugin MapLibre agrandit son conteneur quand la carte change de taille, mais pas le dessin lui-même :
 // sans ceci, le fond vectoriel garde la taille du plan réduit (40 % de l'écran) et le reste reste vide.
@@ -296,22 +301,104 @@ const layers = {progress: L.layerGroup().addTo(map), transit: L.layerGroup().add
 
 const pin = (ic, cls) => L.divIcon({className: "", html: `<div class="pin ${cls}">${icon(ic)}</div>`,
   iconSize: [34, 42], iconAnchor: [17, 40], popupAnchor: [0, -36]});
+// ---- Repères de la carte : équipements d'accessibilité et établissements -----------------------------------
+// Équipements (entrées accessibles, toilettes, ascenseurs, places PMR…) : carré bleu, comme la signalétique PMR.
+// Établissements (Acceslibre) : rond à la couleur de leur famille, pictogramme de leur activité (js/categories.js)
+// et pastille d'accessibilité de l'entrée (✓ plain-pied, ! marches). Pour rester lisible :
+//  - zoom 16 : les établissements sont de simples points de couleur ; zoom 17 et plus : leurs pictogrammes ;
+//  - deux repères qui se chevauchent : le moins important devient un point (il reprend sa place en zoomant) ;
+//  - itinéraire affiché : la carte se met au service du trajet. Établissements masqués, seuls les équipements
+//    à moins de 30 m du trajet restent (en petit), et seulement les arrêts sur le trajet ou à ses extrémités.
+const poiItems = [];                                         // {m, lat, lon, kind: "infra" | "erp", rank, mode, icons}
+const mkIcon = (html, size) => L.divIcon({className: "", html, iconSize: [size, size], iconAnchor: [size / 2, size / 2], popupAnchor: [0, -size / 2 - 2]});
+function addPoi(m, lat, lon, kind, rank, icons) {
+  poiItems.push({m, lat, lon, kind, rank, icons, mode: null});
+  poiItems.sort((x, y) => x.rank - y.rank);
+}
+function drawErps() {
+  const list = erpList();
+  if (!list.length) return setTimeout(drawErps, 1500);        // fiches pas encore chargées
+  for (const [name, activity, lat, lon, f = {}] of list) {
+    const c = erpCategory(activity), acc = entranceAccess(f);
+    const info = [acc === "ok" ? "Entrée de plain-pied" : acc === "steps" ? "Entrée avec marche(s)" : "Accès de l'entrée non renseigné",
+      f.entree_largeur_mini ? `porte de ${Math.round(f.entree_largeur_mini)} cm` : "", f.sanitaires_adaptes ? "toilettes adaptées" : ""].filter(Boolean);
+    const badge = acc ? `<b class="mk-acc ${acc}">${acc === "ok" ? icon("check") : "!"}</b>` : "";
+    const icons = {full: mkIcon(`<div class="mk mk-erp" style="--c:${c.color}">${icon(c.icon)}${badge}</div>`, 30),
+      dot: mkIcon(`<div class="mk-dot" style="--c:${c.color}"></div>`, 12)};
+    const m = L.marker([lat, lon], {icon: icons.full, title: `${name} · ${activity}`, riseOnHover: true})
+      .bindPopup(() => { const fr = whereAmI(); return guidePopup(name, `<div class="pp-type" style="color:${c.color}">${icon(c.icon)} ${esc(activity)}</div>
+        <div class="pp-src">${esc(info.join(" · "))}</div>`, fr ? haversineM(fr.lat, fr.lon, lat, lon) : null); }, {maxWidth: 290})
+      .on("popupopen", ev => { ev.popup.getElement().querySelector(".pp-guide").onclick = () => guideToPoint(name, lat, lon); });
+    addPoi(m, lat, lon, "erp", acc === "ok" ? 1 : 2, icons);
+  }
+  schedulePoi();
+}
+// Le trajet passe-t-il à moins de maxM mètres de ce point ? (réponse gardée tant que le trajet ne change pas)
+const nearCache = new WeakMap();
+function nearRoute(route, key, lat, lon, maxM) {
+  let c = nearCache.get(route);
+  if (!c) nearCache.set(route, c = new Map());
+  if (!c.has(key)) {
+    const g = route.geometry, k = Math.cos(lat * Math.PI / 180) * 111320;
+    let best = Infinity;
+    for (let i = 1; i < g.length && best > maxM; i++) {
+      const ax = (g[i - 1].lon - lon) * k, ay = (g[i - 1].lat - lat) * 111320, bx = (g[i].lon - lon) * k, by = (g[i].lat - lat) * 111320;
+      const dx = bx - ax, dy = by - ay, L2 = dx * dx + dy * dy, t = L2 ? Math.max(0, Math.min(1, -(ax * dx + ay * dy) / L2)) : 0;
+      best = Math.min(best, Math.hypot(ax + t * dx, ay + t * dy));
+    }
+    c.set(key, best <= maxM);
+  }
+  return c.get(key);
+}
+const shownRoute = () => S.screen === "route" && S.dest && S.routes.length ? S.routes[S.selected] || S.routes[0] : null;
+let poiFrame = 0;
+function schedulePoi() { cancelAnimationFrame(poiFrame); poiFrame = requestAnimationFrame(updatePoiMarkers); }
+function updatePoiMarkers() {
+  // (itinéraire affiché : les équipements du trajet restent visibles dès le zoom 14, la vue d'ensemble du trajet)
+  const z = map.getZoom(), route = shownRoute(), show = z >= (route ? 14 : 16) && S.screen !== "nav";
+  document.body.classList.toggle("zoomed-out", !show);
+  if (!show) { layers.pois.remove(); return; }
+  layers.pois.addTo(map);
+  const view = map.getBounds().pad(0.15), taken = [];
+  for (const p of poiItems) {
+    let mode = "hidden";
+    if (route) mode = p.kind === "infra" && nearRoute(route, p, p.lat, p.lon, 30) ? "mini" : "hidden";
+    else if (view.contains([p.lat, p.lon])) {
+      if (p.kind === "erp" && z < 17) mode = "dot";
+      else {
+        const pt = map.latLngToContainerPoint([p.lat, p.lon]);
+        if (taken.some(q => Math.abs(q.x - pt.x) < 28 && Math.abs(q.y - pt.y) < 28)) mode = p.kind === "erp" ? "dot" : "full";
+        else { mode = "full"; taken.push(pt); }
+      }
+    }
+    if (p.mode === mode) continue;
+    if (mode === "hidden") layers.pois.removeLayer(p.m);
+    else {
+      p.m.setIcon(p.icons[mode]);
+      p.m.setZIndexOffset(mode === "dot" ? -200 : p.kind === "infra" ? 300 : 100);
+      if (!p.mode || p.mode === "hidden") layers.pois.addLayer(p.m);
+    }
+    p.mode = mode;
+  }
+}
+map.on("zoomend moveend", () => schedulePoi());
 function drawNetwork() {
   // Le réseau piéton et ses pentes servent au calcul des itinéraires (base de données) : ils ne sont plus dessinés
   for (const [kind, lat, lon, name, status] of net.pois) {
     if (!POI[kind]) continue;
-    L.marker([lat, lon], {icon: pin(POI[kind][0], "pin-poi"), title: POI[kind][1]})
-      .bindPopup(`<div class="pp"><div class="pp-title">${POI[kind][1]}</div>${name ? esc(name) : ""}${
-        kind === "elevator" ? `<div class="pp-src">État : ${{ok: "en service", out_of_order: "en panne"}[status] || "inconnu"}</div>` : ""}</div>`)
-      .addTo(layers.pois);
+    const label = name ? `${POI[kind][1]} · ${name}` : POI[kind][1];
+    const icons = {full: mkIcon(`<div class="mk mk-infra">${icon(POI[kind][0])}</div>`, 30),
+      mini: mkIcon(`<div class="mk mk-infra mk-mini">${icon(POI[kind][0])}</div>`, 22)};
+    const m = L.marker([lat, lon], {icon: icons.full, title: label, riseOnHover: true})
+      .bindPopup(() => { const f = whereAmI(); return guidePopup(POI[kind][1], `<div class="pp-type" style="color:#1D5FAF">${icon(POI[kind][0])} Équipement d'accessibilité</div>${name ? esc(name) : ""}${
+        kind === "elevator" ? `<div class="pp-src">État : ${{ok: "en service", out_of_order: "en panne"}[status] || "inconnu"}</div>` : ""}`,
+        f ? haversineM(f.lat, f.lon, lat, lon) : null); }, {maxWidth: 290})
+      .on("popupopen", e => { e.popup.getElement().querySelector(".pp-guide").onclick = () => guideToPoint(label, lat, lon); });
+    addPoi(m, lat, lon, "infra", 0, icons);
   }
+  drawErps();
   L.geoJSON(net.zone.boundary, {style: {color: C.primary, weight: 2, fill: false, dashArray: "6 8", opacity: .7}, interactive: false}).addTo(map);
-  syncLayers = () => {
-    const show = map.getZoom() >= 16 && S.screen !== "nav";
-    show ? layers.pois.addTo(map) : layers.pois.remove();
-    document.body.classList.toggle("zoomed-out", !show);
-  };
-  map.on("zoomend", syncLayers);
+  syncLayers = schedulePoi;                                // (appelé à chaque affichage : écran, itinéraire)
   syncLayers();
 }
 // L'obstacle n'est plus là (ou signalé par erreur) : on le retire, et l'itinéraire est recalculé sans lui
@@ -322,6 +409,11 @@ const transitIcon = mode => {
   const m = MODE[mode] || MODE.bus;
   return L.divIcon({className: "", html: `<div class="pin pin-transit" style="background:${m.color}">${icon(m.icon)}</div>${m.badge ? `<b class="pin-badge" style="background:${m.color}">${m.badge}</b>` : ""}`,
     iconSize: [34, 42], iconAnchor: [17, 40], popupAnchor: [0, -36]});
+};
+const transitMini = mode => {
+  const m = MODE[mode] || MODE.bus;
+  return L.divIcon({className: "", html: `<div class="mk mk-mini mk-transit" style="--c:${m.color}">${icon(m.icon)}</div>`,
+    iconSize: [22, 22], iconAnchor: [11, 11], popupAnchor: [0, -13]});
 };
 const chipInk = hex => {                                   // texte lisible sur la couleur de la ligne
   const c = /^#?([0-9a-f]{6})$/i.exec(hex || "");
@@ -365,12 +457,17 @@ function refreshTransit(force = false) {
     list = transit.map(st => [st, haversineM(c.lat, c.lon, st.lat, st.lon)]).filter(([, d]) => d <= 200);
     list.sort((a, b) => a[1] - b[1]); list = list.slice(0, 8);
   } else if (S.screen === "route" && map.getZoom() >= 15) {
-    const b = map.getBounds(), c = map.getCenter();
-    list = transit.filter(st => b.contains([st.lat, st.lon])).map(st => [st, haversineM(c.lat, c.lng, st.lat, st.lon)]);
+    // itinéraire affiché : seulement les arrêts sur le trajet (30 m) ou près du départ et de l'arrivée (150 m)
+    const b = map.getBounds(), c = map.getCenter(), route = shownRoute();
+    const useful = st => !route || nearRoute(route, st, st.lat, st.lon, 30) ||
+      haversineM(st.lat, st.lon, S.origin.lat, S.origin.lon) < 150 || haversineM(st.lat, st.lon, S.dest.lat, S.dest.lon) < 150;
+    list = transit.filter(st => b.contains([st.lat, st.lon]) && useful(st)).map(st => [st, haversineM(c.lat, c.lng, st.lat, st.lon)]);
     list.sort((a, b2) => a[1] - b2[1]); list = list.slice(0, 30);
   }
+  // itinéraire affiché : arrêts en petites pastilles rondes, pour ne pas masquer le tracé
+  const small = S.screen === "route" && !!shownRoute();
   for (const [st] of list)
-    L.marker([st.lat, st.lon], {icon: transitIcon(st.mode), title: `${(MODE[st.mode] || MODE.bus).label} ${st.name}`, keyboard: true})
+    L.marker([st.lat, st.lon], {icon: small ? transitMini(st.mode) : transitIcon(st.mode), title: `${(MODE[st.mode] || MODE.bus).label} ${st.name}`, keyboard: true})
       .bindPopup(() => transitPopup(st), {maxWidth: 290})
       .on("popupopen", e => { e.popup.getElement().querySelector(".pp-guide").onclick = () => guideToStop(st); })
       .addTo(layers.transit);
@@ -418,6 +515,8 @@ function drawReports() {
   }
 }
 function drawRoutes() {
+  schedulePoi();
+  setTimeout(updateHereLink, 0);
   drawRealPosition();
   layers.routes.clearLayers();
   layers.marks.clearLayers();
@@ -441,8 +540,13 @@ function drawRoutes() {
     L.polyline(ll, {color: C.routeCase, weight: nav ? 10 : 11, opacity: nav ? .35 : .9, lineCap: "round", lineJoin: "round"}).addTo(layers.routes);
     if (nav) gradientLine(ll).forEach(l => l.addTo(layers.routes));
     else L.polyline(ll, {color: C.route, weight: 6, opacity: 1, lineCap: "round", lineJoin: "round"}).addTo(layers.routes);
+    // fin du trajet -> porte : pointillés, comme Google Maps
+    const e = sel.geometry.at(-1);
+    if (S.dest && haversineM(e.lat, e.lon, S.dest.lat, S.dest.lon) > 12)
+      L.polyline([[e.lat, e.lon], [S.dest.lat, S.dest.lon]], {color: C.route, weight: 4, dashArray: "2 9", lineCap: "round", interactive: false}).addTo(layers.routes);
   }
-  if (!S.nav) L.marker([S.origin.lat, S.origin.lon], {icon: L.divIcon({className: "", html: '<div class="start-dot"></div>', iconSize: [24, 24]}),
+  const underDot = S.origin.gps && liveFix && hereMarker && distM(S.origin, liveFix) < 12;
+  if (!S.nav && !underDot) L.marker([S.origin.lat, S.origin.lon], {icon: L.divIcon({className: "", html: '<div class="start-dot"></div>', iconSize: [24, 24]}),
     title: "Départ"}).addTo(layers.marks);
   if (S.dest) L.marker([S.dest.lat, S.dest.lon], {icon: pin("flag", "pin-dest"), title: "Arrivée"}).addTo(layers.marks);
   if (S.nav) {
@@ -463,19 +567,21 @@ function gradientLine(ll) {
 }
 
 // ---- Itinéraire ---------------------------------------------------------------------------
-function computeRoute() {
+function computeRoute({keepView = false} = {}) {
+  const was = S.routes[S.selected]?.label;
   S.routes = []; S.message = null;
-  if (S.dest) {
+  if (S.dest && !originPending()) {                        // en attente d'une position sûre : pas de trajet faux
     try {
       S.routes = computeRoutes(net, {origin: S.origin, destination: S.dest, profile: profileJson(), compare_shortest: true}, reports()).routes;
-      S.selected = 0;
+      const i = keepView ? S.routes.findIndex(r => r.label === was) : -1;
+      S.selected = i >= 0 ? i : 0;                         // départ qui bouge : on garde l'itinéraire choisi
     } catch (e) {
       if (!(e instanceof RoutingError)) throw e;
       S.message = e.message;
     }
   }
   render();
-  if (S.routes.length) { requestAnimationFrame(fitRoute); prepareOffline(S.routes[S.selected]); }
+  if (S.routes.length) { if (!keepView) requestAnimationFrame(fitRoute); prepareOffline(S.routes[S.selected]); }
 }
 // ---- Trajet disponible hors connexion ----------------------------------------------------------
 // Le calcul, le guidage, le GPS et la voix marchent déjà sans réseau ; il manquait la carte. Dès qu'un
@@ -545,9 +651,17 @@ addEventListener("online", () => toast("Connexion retrouvée."));
 function fitRoute() {
   const r = S.routes[S.selected] || S.routes[0];
   if (!r || S.screen !== "route") return;
-  const panelTop = $("panel").getBoundingClientRect().top;
+  // La carte vient souvent de changer de taille (retour du Profil, choix d'un itinéraire) : on la remet à jour
+  // AVANT de cadrer. Sinon Leaflet cadrait avec son ancienne taille et une marge plus grande que la carte : zoom
+  // impossible, fond de carte cassé (noir, seuls les repères restaient) et écran à moitié redessiné (vidéo du 19/10).
+  map.invalidateSize({pan: false});
+  const size = map.getSize(), panelTop = $("panel").getBoundingClientRect().top;
+  if (size.y < 160 || size.x < 160) return;
   const under = !sideLayout() && panelTop > 0 && panelTop < innerHeight ? innerHeight - panelTop : 0;
-  map.fitBounds(L.latLngBounds(r.geometry.map(p => [p.lat, p.lon])), {paddingTopLeft: [24, 84], paddingBottomRight: [24, under + 24]});
+  const bottom = Math.max(24, Math.min(under + 24, size.y - 84 - 120));     // il reste toujours 120 px de carte pour le trajet
+  map.fitBounds(L.latLngBounds(r.geometry.map(p => [p.lat, p.lon])), {paddingTopLeft: [24, 84], paddingBottomRight: [24, bottom], maxZoom: 18, animate: false});
+  // (sans animation de zoom : pendant l'animation, le fond vectoriel n'était redessiné qu'à la fin et l'on voyait
+  // un rectangle de carte rétréci sur un fond sombre, vidéo du 19/10)
 }
 // Au premier affichage de la recherche : si la localisation est déjà autorisée et qu'on est à Gennevilliers,
 // le départ est « Ma position » au lieu de la Mairie (aucune demande d'autorisation surprise)
@@ -559,9 +673,10 @@ async function autoOrigin() {
   autoOriginDone = true;
   try {
     const perm = await navigator.permissions?.query({name: "geolocation"});
+    geoPermission = perm?.state || geoPermission;
     if (perm?.state !== "granted") return;
   } catch { return; }
-  locateOrigin(true);
+  locateOrigin(true, true);
 }
 // Met à jour la ligne « Départ » sans reconstruire le panneau (la saisie en cours n'est pas interrompue)
 function showOrigin() {
@@ -570,24 +685,147 @@ function showOrigin() {
   b.querySelector("b").innerHTML = `${S.origin.gps ? icon("locate-fixed") + " " : ""}${esc(S.origin.label)}`;
   b.setAttribute("aria-label", `Départ : ${S.origin.label}. Toucher pour changer`);
 }
-// Départ = « Ma position ». quiet : sans message d'attente, et sans écraser un départ choisi entre-temps
-function locateOrigin(quiet = false) {
+// ---- Départ « Ma position » vivant (règles : js/origin.js) ---------------------------------------------------
+// Un seul suivi GPS sur l'écran de recherche : il fait bouger le point bleu « vous êtes ici » ET le départ des
+// trajets. Le trajet part donc toujours d'où vous êtes, même si le premier relevé était faux, même après un
+// guidage ou depuis un favori. Pendant le guidage, c'est le suivi du guidage qui prend le relais.
+let hereWatch = null, hereMarker = null, hereCircle = null, hereCentered = false, hereLink = null;
+let liveFix = null, wantOrigin = false, geoPermission = "unknown";
+let originState = {searchSince: null, best: null, lastUseAt: null};
+navigator.permissions?.query?.({name: "geolocation"}).then(p => {
+  geoPermission = p.state;
+  p.onchange = () => { geoPermission = p.state; syncHereDot(); };
+  syncHereDot();
+}).catch(() => {});
+const gpsOriginActive = () => S.originMode === "gps" || (S.originMode === "auto" && wantOrigin);
+// En attente d'une position assez sûre pour calculer (aucun trajet affiché d'ici là : jamais depuis un faux départ)
+const originPending = () => gpsOriginActive() && !!S.originNeedsFix;
+function centerAbovePanel(ll, zoom = 17) {
+  map.invalidateSize({pan: false});
+  const top = $("panel").getBoundingClientRect().top, visible = sideLayout() || top <= 0 ? innerHeight : top;
+  // point placé au milieu de la zone visible (au-dessus du panneau), et non au milieu de l'écran (caché dessous)
+  const shift = (innerHeight - visible) / 2;
+  const p = map.project(L.latLng(ll), zoom).add([0, shift]);
+  map.setView(map.unproject(p, zoom), zoom, {animate: false});
+}
+function startHereWatch() {
+  if (hereWatch !== null || !navigator.geolocation || S.screen !== "route" || S.nav) return;
+  hereWatch = navigator.geolocation.watchPosition(onHereFix, onHereError, {enableHighAccuracy: true, maximumAge: 0, timeout: 30000});
+}
+function stopHereWatch() {
+  if (hereWatch !== null) { navigator.geolocation.clearWatch(hereWatch); hereWatch = null; }
+  hereMarker?.remove(); hereCircle?.remove(); hereLink?.remove(); hereMarker = hereCircle = hereLink = null;
+}
+// Suivi actif sur l'écran de recherche, si la localisation est autorisée ou demandée (« Ma position »)
+function syncHereDot() {
+  const want = S.screen === "route" && !S.nav && !document.hidden && !!navigator.geolocation;
+  if (!want) return stopHereWatch();
+  if (geoPermission === "granted" || gpsOriginActive()) startHereWatch();
+}
+document.addEventListener("visibilitychange", () => syncHereDot());
+function onHereFix(pos) {
+  const now = Date.now(), t = Number.isFinite(pos.timestamp) && pos.timestamp <= now + 1000 ? pos.timestamp : now;
+  const fix = {lat: pos.coords.latitude, lon: pos.coords.longitude, acc: pos.coords.accuracy, at: t};
+  if (!Number.isFinite(fix.lat) || !Number.isFinite(fix.lon)) return;
+  liveFix = fix;
+  geoPermission = "granted";
+  const ll = [fix.lat, fix.lon], acc = Math.min(80, fix.acc || 80);
+  if (!hereMarker) {
+    hereCircle = L.circle(ll, {radius: acc, color: "#2F80ED", weight: 1, opacity: .4, fillColor: "#2F80ED", fillOpacity: .12, interactive: false}).addTo(map);
+    hereMarker = L.marker(ll, {icon: L.divIcon({className: "", html: '<div class="here-dot"></div>', iconSize: [22, 22]}),
+      interactive: false, keyboard: false, zIndexOffset: 900}).addTo(map);
+  } else { hereMarker.setLatLng(ll); hereCircle.setLatLng(ll).setRadius(acc); }
+  // première position, sans destination : la carte se centre sur vous, dans la partie visible au-dessus du panneau
+  if (!hereCentered && !S.dest && S.screen === "route") { hereCentered = true; centerAbovePanel(ll); }
+  if (gpsOriginActive()) applyOriginFix(fix);
+  updateHereLink();
+}
+function onHereError(err) {
+  if (err?.code !== 1) return;                               // relevé momentanément impossible : le suivi continue
+  geoPermission = "denied";
+  stopHereWatch();
+  const asked = S.originMode === "gps";
+  wantOrigin = false; S.originNeedsFix = false;
+  if (asked) {
+    if (!S.origin.gps) S.originMode = "manual";              // on garde le départ affiché (Mairie, adresse…)
+    locationHelp();
+  }
+  if (S.screen === "route" && S.dest) computeRoute();
+}
+function applyOriginFix(fix) {
+  const now = Date.now(), cur = S.origin.gps ? S.origin : null;
+  const r = decideOrigin({origin: S.originNeedsFix ? null : cur, searchSince: originState.searchSince ?? now,
+    best: originState.best, lastUseAt: originState.lastUseAt}, fix, now);
+  if (r.action === "confirm") { S.origin.confirmedAt = now; return; }
+  if (r.action === "wait") { originState.best = r.best; originState.searchSince ??= now; return updateLocating(); }
+  if (r.action !== "use") return;
+  const f = r.fix;
+  try { nearestNode(net, f.lat, f.lon); } catch {
+    wantOrigin = false; S.originNeedsFix = false;
+    if (S.originMode === "gps" && !S.origin.gps) S.originMode = "out";
+    toast(`Vous êtes hors de la zone couverte (${zoneLabel(ZONE)}) : touchez « Départ » pour choisir une adresse.`, 6000);
+    if (S.screen === "route" && S.dest) computeRoute();
+    return;
+  }
+  const moved = cur ? distM(cur, f) : Infinity;
+  S.origin = {lat: f.lat, lon: f.lon, acc: f.acc, confirmedAt: now, label: "Ma position", gps: true};
+  S.originMode = "gps"; S.originNeedsFix = false;
+  originState = {searchSince: null, best: null, lastUseAt: now};
+  if (S.screen !== "route" || S.searchFor === "origin") return;
+  if (S.dest) computeRoute({keepView: moved < 60}); else showOrigin();
+}
+// Plus de nouvelle position depuis longtemps : on le dit (et, en départ automatique, on garde le départ affiché)
+setInterval(() => {
+  if (!originPending() || S.screen !== "route") return;
+  const waited = Date.now() - (originState.searchSince ?? Date.now());
+  // aucun relevé du tout depuis 10 s (à l'intérieur, GPS coupé) : inutile d'attendre davantage
+  if (waited < 10000 || originState.best) return updateLocating();
+  if (S.originMode === "auto") {                             // jamais demandé explicitement : départ affiché
+    wantOrigin = false; S.originNeedsFix = false;
+    toast("Position introuvable pour l'instant : trajet depuis le départ affiché. Touchez « Départ » pour le changer.", 6000);
+    if (S.dest) computeRoute();
+  } else updateLocating(true);
+}, 1000);
+// Pointillés du point bleu jusqu'au début du trajet (comme Google Maps) : on voit toujours comment le rejoindre
+function updateHereLink() {
+  hereLink?.remove(); hereLink = null;
+  const r = S.screen === "route" && !S.nav ? S.routes[S.selected] : null;
+  if (!r || !liveFix || !hereMarker || Date.now() - liveFix.at > 15000) return;
+  const g0 = r.geometry[0];
+  if (haversineM(liveFix.lat, liveFix.lon, g0.lat, g0.lon) < 6 || haversineM(liveFix.lat, liveFix.lon, g0.lat, g0.lon) > 400) return;
+  hereLink = L.polyline([[liveFix.lat, liveFix.lon], [g0.lat, g0.lon]], {color: C.route, weight: 4, dashArray: "2 9",
+    lineCap: "round", interactive: false}).addTo(map);
+}
+function locatingHtml(lost = false) {
+  const b = originState.best, waited = Date.now() - (originState.searchSince ?? Date.now());
+  const txt = lost ? "Position introuvable pour l'instant (à l'intérieur, le GPS capte mal). Sortez un peu, ou touchez « Départ » pour choisir une adresse."
+    : b ? `Position encore imprécise (à ${Math.round(b.acc)} m près) : on attend mieux pour vous éviter un faux départ…`
+    : waited > 4000 ? "Recherche de votre position… (autorisez la localisation si le téléphone le demande)" : "Recherche de votre position…";
+  return `<div class="msg locating" id="locating" role="status" aria-live="polite">${icon("locate-fixed")}<span>${esc(txt)}</span></div>`;
+}
+function updateLocating(lost = false) {
+  const el = $("locating");
+  if (el) el.outerHTML = locatingHtml(lost);
+}
+// Départ = « Ma position ». quiet : sans message ; ifGranted : seulement si la localisation est déjà autorisée
+// (au lancement de l'appli : aucune demande surprise). Au choix d'une destination, elle peut être demandée.
+function locateOrigin(quiet = false, ifGranted = false) {
   if (!navigator.geolocation) { if (!quiet) toast("La localisation n'est pas disponible sur cet appareil."); return; }
-  if (!quiet) toast("Recherche de votre position…");
-  navigator.geolocation.getCurrentPosition(pos => {
-    const p = {lat: pos.coords.latitude, lon: pos.coords.longitude, label: "Ma position", gps: true};
-    if (quiet && S.originMode === "manual") return;         // l'usager a choisi un autre départ entre-temps
-    try {
-      nearestNode(net, p.lat, p.lon);
-    } catch {
-      S.originMode = "out";
-      return toast(`Vous êtes hors de la zone couverte (${zoneLabel(ZONE)}) : départ fixé à « ${S.origin.label} ». ` +
-                   "Touchez « Départ » pour en choisir un autre.", 6000);
-    }
-    S.origin = p; S.originMode = "gps";
-    if (S.screen === "route") S.dest ? computeRoute() : showOrigin();
-  }, () => { if (!quiet) toast("Position refusée ou indisponible : touchez « Départ » pour choisir une adresse."); },
-  {enableHighAccuracy: true, timeout: 15000, maximumAge: 20000});
+  if (geoPermission === "denied") {                         // refusée : on explique comment l'autoriser
+    if (!quiet && !ifGranted) { if (!S.origin.gps) S.originMode = "manual"; locationHelp(); }
+    return;
+  }
+  if (ifGranted && geoPermission !== "granted") return;
+  if (S.originMode === "manual" && quiet) return;            // l'usager a choisi un autre départ
+  wantOrigin = true;
+  if (!quiet) S.originMode = "gps";
+  if (!originValid(S.origin.gps ? S.origin : null, Date.now())) {
+    S.originNeedsFix = true;
+    originState = {searchSince: Date.now(), best: null, lastUseAt: originState.lastUseAt};
+  }
+  startHereWatch();
+  // la dernière position reçue est peut-être déjà assez bonne
+  if (liveFix) applyOriginFix(liveFix);
 }
 let searchTimer = null;
 function search(q) {
@@ -612,7 +850,8 @@ function search(q) {
         const type = ZONE.france ? p._type : (p.name && p.osm_key !== "highway" && p.osm_key !== "place" ? "poi" : "address");
         const label = ZONE.france ? p.label || [p.toponym, (p.city || [])[0]].filter(Boolean).join(", ")
           : [p.name || [p.housenumber, p.street].filter(Boolean).join(" "), p.district || p.city].filter(Boolean).join(", ");
-        return {label, lat, lon, type, sub: `${type === "poi" ? "Lieu" : "Adresse"} · ${short(haversineM(S.origin.lat, S.origin.lon, lat, lon))}`};
+        return {label, lat, lon, type, banId: ZONE.france && p._type === "address" ? p.id : null,
+          sub: `${type === "poi" ? "Lieu" : "Adresse"} · ${short(haversineM(S.origin.lat, S.origin.lon, lat, lon))}`};
       }).filter(a => a.label).filter(a => haversineM(S.origin.lat, S.origin.lon, a.lat, a.lon) < 15000);   // pas de « Calmels-et-le-Viala » à 550 km
       S.places = [...local, ...addr].filter((p, i, all) => all.findIndex(o => norm2(o.label) === norm2(p.label) && haversineM(o.lat, o.lon, p.lat, p.lon) < 150) === i).slice(0, 10);
     } catch {
@@ -652,7 +891,7 @@ function startNav(route, keepGps = false) {
            gpsInfo: prev?.gpsInfo || "", gpsStatus: prev?.gpsStatus || "", lastReroute: prev?.lastReroute || 0,
            said: new Set(), off: 0, back: 0, dHist: [], offRoute: false, away: false, gap: 0, gapAlong: 0, arrived: false,
            // N°15 : « approach » tant que le point de départ n'est pas atteint ; « route » ensuite
-           phase: "approach", approachDist: 0, quietStart: keepGps};
+           phase: "approach", approachDist: 0, quietStart: keepGps, startedAt: prev?.startedAt || Date.now()};
   S.nav.hazards = hazardsOn(S.nav);
   requestWakeLock();
 }
@@ -779,13 +1018,20 @@ function navState() {
   for (let i = 0; i < steps.length - 1; i++) if (n.pos >= n.stepAt[i] - 0.5) idx = i;
   // Arrivée : fin de l'itinéraire ET vraie position proche de la fin (sinon un GPS en avance déclenchait trop tôt)
   const r = n.real, fresh = r && Date.now() - r.at < 15000, end = n.route.geometry.at(-1);
-  const near = !fresh || haversineM(r.lat, r.lon, end.lat, end.lon) <= Math.max(10, Math.min(r.acc, 25));
+  // Dernier bout à pied (comme Google Maps) : le réseau s'arrête souvent avant la porte (adresse au milieu d'un
+  // bâtiment, cour, allée non cartographiée). On ne dit « arrivé » qu'une fois près de l'ADRESSE ; entre la fin
+  // du tracé et la porte, des pointillés et « Continuez jusqu'à l'adresse ».
+  const dest = S.dest, lastLeg = dest ? haversineM(end.lat, end.lon, dest.lat, dest.lon) : 0, target = lastLeg > 12 ? dest : end;
+  const toDest = fresh && dest ? haversineM(r.lat, r.lon, dest.lat, dest.lon) : lastLeg;
+  const near = !fresh || haversineM(r.lat, r.lon, target.lat, target.lon) <= Math.max(10, Math.min(r.acc, lastLeg > 12 ? 20 : 25));
   const arrived = n.arrived || (n.phase !== "approach" && n.pos >= n.total - 3 && near);
+  const final = !arrived && lastLeg > 12 && n.phase !== "approach" && n.pos >= n.total - 3;
   const next = arrived ? steps.at(-1) : steps[idx + 1];
   const toManeuver = arrived ? 0 : Math.max(0, n.stepAt[idx + 1] - n.pos);
   const lower = next.text.charAt(0).toLowerCase() + next.text.slice(1);
   const spoken = arrived ? "Vous êtes arrivé" : toManeuver < 15 ? next.text : `Dans ${short(toManeuver)}, ${lower}`;
-  return {idx, next, toManeuver, remaining: Math.max(0, n.total - n.pos) + (n.phase === "approach" ? n.approachDist : 0), arrived, spoken};
+  return {idx, next, toManeuver, arrived, spoken, final, toDest, lastLeg,
+    remaining: Math.max(0, n.total - n.pos) + (n.phase === "approach" ? n.approachDist : 0) + (final ? toDest : lastLeg > 12 && !arrived ? lastLeg : 0)};
 }
 function announce() {
   const n = S.nav, st = navState();
@@ -805,6 +1051,10 @@ function announce() {
     return;
   }
   if (n.phase === "approach") return;
+  if (st.final) {
+    if (!n.said.has("final")) { n.said.add("final"); say(`L'adresse est à ${Math.round(st.toDest)} mètres. Suivez les pointillés jusqu'à la porte.`, true); buzz("tick"); }
+    return;
+  }
   // « Données à confirmer » n'est pas un danger : pas dit à voix haute (il reste sur la fiche de l'itinéraire)
   const spokenAlerts = st.next.alerts.filter(a => a !== "Données à confirmer");
   const i = st.idx + 1, alerts = spokenAlerts.length ? `. Attention : ${spokenAlerts.join(", ")}` : "";
@@ -860,7 +1110,11 @@ function reroute(from, title, manual = false, fromStart = false) {
     startNav(res.routes[0], true);
     S.routes = res.routes; S.selected = 0;
     if (!fromStart) S.nav.rerouted = {at: Date.now(), title};           // départ normal : pas de bandeau d'alerte
-    if (fromStart) { S.nav.fromHere = true; S.nav.quietStart = false; S.origin = {lat: from.lat, lon: from.lon, label: "Ma position"}; }
+    if (fromStart) {
+      S.nav.fromHere = true; S.nav.quietStart = false;
+      S.origin = {lat: from.lat, lon: from.lon, acc: S.nav.real?.acc ?? 20, confirmedAt: Date.now(), label: "Ma position", gps: true};
+      S.originMode = "gps";
+    }
     S.nav.gpsInfo = "";
   } catch (e) {
     if (!(e instanceof RoutingError)) throw e;
@@ -885,10 +1139,9 @@ function wrongWay() {
 function onGpsError(err) {
   const n = S.nav;
   if (!n) return;
-  const ios = /iphone|ipad|ipod/i.test(navigator.userAgent);
+  n.gpsDenied = err.code === 1;
   n.gpsProblem = err.code === 1
-    ? `La localisation est refusée. ${ios ? "Réglages → Confidentialité → Service de localisation → Safari (ou Vision AR) → « Lorsque l'app est active »"
-                                         : "Paramètres du navigateur → Autorisations du site → Position → Autoriser"}, puis réessayez.`
+    ? "La localisation est refusée. Touchez ici pour l'autoriser en quelques gestes."
     : "Position introuvable pour l'instant (à l'intérieur, le GPS capte mal). Réessayez à l'extérieur.";
   n.gpsInfo = "";
   renderNavLive();
@@ -946,6 +1199,13 @@ function onGps(pos, precise = false) {
     }
     return renderNavLive();
   }
+  // Dernier bout à pied, de la fin du tracé jusqu'à la porte : on n'est pas « hors itinéraire » (pas de recalcul,
+  // qui repartait de l'adresse elle-même) ; on suit simplement la distance jusqu'à l'adresse.
+  const endPt = g.at(-1), legLen = S.dest ? haversineM(endPt.lat, endPt.lon, S.dest.lat, S.dest.lon) : 0;
+  if (legLen > 12 && n.pos >= n.total - 3 && haversineM(p.lat, p.lon, S.dest.lat, S.dest.lon) <= legLen + Math.max(25, acc)) {
+    Object.assign(n, {gap: 0, gapAlong: n.total, away: false, offRoute: false, off: 0});
+    announce(); return renderNavLive();
+  }
   n.gap = best?.d ?? 0;
   n.gapAlong = best?.along ?? n.pos;
   // « À l'écart de l'itinéraire » (intérieur, cour) seulement si l'écart dépasse nettement l'erreur du GPS,
@@ -958,7 +1218,14 @@ function onGps(pos, precise = false) {
       if (++n.back >= 3) { n.back = 0; n.pos = best.along; wrongWay(); }
     } else n.back = 0;
     // GPS imprécis : on n'accroche pas de force au tracé, on avance prudemment (N°4)
-    return moveTo(Math.max(n.pos, acc > 25 ? Math.min(best.along, n.pos + 15) : best.along));
+    const to = Math.max(n.pos, acc > 25 ? Math.min(best.along, n.pos + 15) : best.along), now = Date.now();
+    // vitesse de marche estimée sur les dernières mesures (sert à avancer entre deux mesures, voir plus bas)
+    if (n.lastFix && now - n.lastFix.at < 8000) {
+      const v = Math.max(0, Math.min(2.5, (to - n.lastFix.along) / ((now - n.lastFix.at) / 1000)));
+      n.walkSpeed = n.walkSpeed == null ? v : 0.7 * n.walkSpeed + 0.3 * v;
+    }
+    n.lastFix = {along: to, at: now};
+    return moveTo(to);
   }
   n.offRoute = true; n.back = 0;
   n.gpsInfo = `Vous vous éloignez de l'itinéraire (${Math.round(best?.d ?? 0)} m) : nouveau calcul en cours…`;
@@ -998,15 +1265,25 @@ function steer() {
 }
 setInterval(steer, 1000);
 let realMarker = null;
+// Terrain du 19/10 : deux points (bleu sur le trajet, orange GPS brut) éloignés de plusieurs mètres troublaient la
+// lecture. Un seul point (le bleu) ; la précision du GPS est un cercle léger centré sur lui (dessiné par renderNavLive).
 function drawRealPosition() {
   const r = S.nav?.real;
   if (!r) { realMarker?.remove(); realMarker = null; return; }
-  if (!realMarker) realMarker = L.layerGroup().addTo(map);
-  realMarker.clearLayers();
-  L.circle([r.lat, r.lon], {radius: r.acc, color: "#C2410C", weight: 1, fillColor: "#F59E0B", fillOpacity: .15, interactive: false}).addTo(realMarker);
-  L.circleMarker([r.lat, r.lon], {radius: 8, color: "#fff", weight: 3, fillColor: "#C2410C", fillOpacity: 1})
-    .bindTooltip("Ma position GPS").addTo(realMarker);
+  if (!realMarker) realMarker = L.circle([r.lat, r.lon], {radius: r.acc, color: "#2F80ED", weight: 1, opacity: .35,
+    fillColor: "#2F80ED", fillOpacity: .08, interactive: false}).addTo(map);
+  realMarker.setRadius(Math.min(60, r.acc));
 }
+// Entre deux mesures GPS (souvent 1 à 3 s sur iPhone), la progression avance au rythme de la marche mesuré :
+// le décompte de distance ne reste plus figé. Au plus 6 m d'avance sur la dernière mesure ; la suivante corrige.
+setInterval(() => {
+  const n = S.nav;
+  if (!n || n.phase !== "route" || n.offRoute || n.away || n.arrived || !n.lastFix || document.hidden) return;
+  const dt = (Date.now() - n.lastFix.at) / 1000, v = n.walkSpeed ?? 0;
+  if (dt > 4 || v < 0.4 || v > 2.2) return;
+  const target = Math.min(n.total, n.lastFix.along + Math.min(6, v * dt));
+  if (target > n.pos + 0.3) moveTo(target);
+}, 1000);
 let wakeLock = null;
 async function requestWakeLock() {
   try { wakeLock = await navigator.wakeLock?.request("screen"); } catch { /* non supporté */ }
@@ -1049,7 +1326,7 @@ function screenProfile() {
 }
 const OPTION_KEYS = {detect: "va-detect", detectDebug: "va-detect-debug", dataConsent: "va-data-consent", autoLowConf: "va-auto-lowconf"};
 // ---- Paramètres : tout ce qui concerne l'appli, rangé au même endroit ----------------------------------
-const APP_VERSION = "68";
+const APP_VERSION = "89";
 // Site stable (/vision-ar/) ou site de test (/vision-ar-demo/, ordinateur) : affiché dans les Paramètres
 const APP_CHANNEL = location.pathname.split("/")[1] === "vision-ar" ? "stable" : "test";
 function screenSettings() {
@@ -1187,9 +1464,10 @@ function screenRoute() {
   ${S.dest ? `<div class="routes-head"><h3>${icon("route")} Choisissez votre itinéraire</h3>
     <button class="btn soft small fav-toggle ${currentFavIndex() >= 0 ? "on" : ""}" id="favToggle" aria-pressed="${currentFavIndex() >= 0}">
       ${icon("star")} ${currentFavIndex() >= 0 ? "Enregistré" : "Enregistrer"}</button></div>` : ""}
+  ${S.dest && originPending() ? locatingHtml() : ""}
   ${S.message ? `<div class="msg warn">${icon("circle-alert")}<span>${esc(S.message)}</span></div>` : ""}
   ${S.routes.map((r, i) => routeCard(r, i)).join("")}
-  ${S.dest && S.arrival ? arrivalCard(S.arrival) : ""}${indoorButton()}
+  ${doorCard()}${S.dest && S.arrival ? arrivalCard(S.arrival) : ""}${indoorButton()}
   ${S.routes.length ? `<button class="btn primary" id="start" ${chosen?.accessible ? "" : "disabled"}>${icon("navigation")} Démarrer le guidage</button>` : ""}`}`;
 }
 // Liste des résultats de recherche : mise à jour seule pendant la frappe (le champ n'est jamais reconstruit,
@@ -1239,7 +1517,8 @@ function useFavorite(id) {
   const f = favorites().find(x => x.id === id);
   if (!f) return;
   if (f.origin.gps) {
-    if (!S.origin.gps) S.originMode = "auto";            // repart de « Ma position » dès qu'elle est connue
+    S.originMode = "gps";                                // « depuis Ma position » : d'où vous êtes MAINTENANT
+    locateOrigin();
   } else {
     S.origin = {lat: f.origin.lat, lon: f.origin.lon, label: f.origin.label}; S.originMode = "manual";
   }
@@ -1254,7 +1533,7 @@ function favoritesHtml() {
   const list = favorites();
   return `<section class="favs" aria-labelledby="favsTitle"><h3 id="favsTitle">${icon("star")} Mes trajets favoris</h3>
     ${list.length ? `<div class="places">${list.map(f => `<div class="fav-row">
-        <button class="place" data-fav="${f.id}" aria-label="Lancer le trajet de ${esc(f.origin.label)} à ${esc(f.dest.label)}">
+        <button class="place" data-fav="${f.id}" data-key="fav-${f.id}" aria-label="Lancer le trajet de ${esc(f.origin.label)} à ${esc(f.dest.label)}">
           <span class="place-ic">${icon("route")}</span><span class="grow">${esc(f.dest.label)}<small>depuis ${esc(f.origin.label)}</small></span>
           ${icon("chevron-right")}</button>
         <button class="fav-del" data-unfav="${f.id}" aria-label="Retirer ${esc(f.dest.label)} des favoris">${icon("trash-2")}</button></div>`).join("")}</div>`
@@ -1274,14 +1553,16 @@ function pickPlace(i) {
 function placesHtml() {
   const list = placeList();
   if (!list.length && S.searchFor === "dest" && !S.dest && !S.query.trim()) return favoritesHtml();
-  return list.length ? `<div class="places">${list.map((p, i) => `<button class="place" data-place="${i}">
+  return list.length ? `<div class="places">${list.map((p, i) => `<button class="place" data-place="${i}" data-key="place-${esc(p.label)}-${esc(p.sub || "")}">
       <span class="place-ic" ${p.color ? `style="color:${p.color}"` : ""}>${icon(p.icon || (p.type === "poi" ? "map-pin" : "map"))}</span><span class="grow">${esc(p.label)}<small>${esc(p.sub || (p.type === "poi" ? "Lieu" : "Adresse"))}</small></span>
       ${icon("chevron-right")}</button>`).join("")}</div>` : "";
 }
 function renderPlaces() {
   const box = $("placesBox");
   if (!box) return;
+  const before = new Set([...box.querySelectorAll("[data-key]")].map(el => el.dataset.key));
   box.innerHTML = placesHtml();
+  for (const k of markEntering(box, before)) shownKeys.add(k);
   bindPlaces(box);
   layoutSheet();
 }
@@ -1292,7 +1573,7 @@ function indoorButton() {
 }
 function arrivalCard(f) {
   if (!f.lines.length) return `<p class="fine arrive-none">${icon("door-open")} Pas encore d'information sur l'accès à ce lieu.</p>`;
-  return `<section class="arrive-card" aria-labelledby="arrTitle"><div class="arrive-head"><h3 id="arrTitle">${icon("door-open")} À l'arrivée</h3>
+  return `<section class="arrive-card" data-key="arrive-${esc(f.name)}" aria-labelledby="arrTitle"><div class="arrive-head"><h3 id="arrTitle">${icon("door-open")} À l'arrivée</h3>
       <button class="btn soft small" id="arrSpeak">${icon("volume-2")} Écouter</button></div>
     <ul>${f.lines.map(l => `<li class="${l.tone}">${icon(l.ic)}<span>${esc(l.text)}</span></li>`).join("")}</ul>
     <p class="fine">Sources : ${esc(f.sources.join(", "))}.</p></section>`;
@@ -1325,7 +1606,7 @@ function routeCard(r, i) {
       .concat(incomplete ? [`<span class="tag warn">${icon("info")} données à confirmer</span>`] : [])
     : r.blocking_issues.map(w => `<span class="tag danger">${icon("triangle-alert")} ${esc(w)}</span>`);
   const stk = i === 0 && r.accessible ? (!r.steps_count ? "zero-marche" : r.max_slope_pct <= 5 ? "pente-douce" : "") : "";
-  return `<div class="rcard ${i === S.selected ? "sel" : ""} ${stk ? "stk-host" : ""}" data-route="${i}" role="button" tabindex="0"
+  return `<div class="rcard ${i === S.selected ? "sel" : ""} ${stk ? "stk-host" : ""}" data-route="${i}" data-key="route-${esc(S.dest?.label || "")}-${esc(r.label)}" role="button" tabindex="0"
       aria-label="${esc(r.label)}, ${min} minutes, ${short(r.length_m)}${r.accessible ? "" : ", non praticable"}${i === S.selected ? ", sélectionné" : ""}">
     <div class="rc-head"><div class="grow"><b>${esc(r.label)}</b>${badge}</div><div class="rc-time"><b>${min}</b> min</div></div>
     <div class="rc-meta">
@@ -1342,10 +1623,11 @@ const navApi = {
   state: () => S.nav && {nav: S.nav, st: navState(), posAt, net, dest: S.dest, reports: reports(), speed: speed(),
     mobility: primary(), voice: S.voice, theme: S.theme, haptics: S.haptics, hapticsNote: hapticsNote(),
     detect: S.detect, detectDebug: S.detectDebug, dataConsent: S.dataConsent, autoLowConf: S.autoLowConf,
-    gpsInfo: S.nav.gpsInfo, gpsProblem: S.nav.gpsProblem, gpsStatus: S.nav.gpsStatus,
+    gpsInfo: S.nav.gpsInfo, gpsProblem: S.nav.gpsProblem, gpsDenied: S.nav.gpsDenied, gpsStatus: S.nav.gpsStatus,
     placesRange: S.placesRange, eco: ecoNow(), audioOnly: S.audioOnly},
   reroute: () => manualReroute(),
   setOption: (key, value) => { S[key] = value; store.set(OPTION_KEYS[key], value); },
+  locationHelp: () => locationHelp(),
   obstacleAlert: text => { say(text, DANGER); buzz("obstacle"); },
   say: (text, level = INFO) => say(text, level),
   nativeFix: (lat, lon, acc) => onGps({coords: {latitude: lat, longitude: lon, accuracy: acc}}, true),
@@ -1355,16 +1637,38 @@ const navApi = {
   setTheme,
   report: (kind, blocking) => doReport(kind, blocking),
   stop: () => stopGuidance(),
+  endSoftly: () => endGuidanceSoftly(),
+  stay: () => { if (S.nav) S.nav.stayed = true; },
 };
+// Arrivée (terrain du 20/10 : la sortie était brutale) : écran « Vous êtes arrivé » avec le résumé du trajet,
+// boutons Terminer / Rester. Sans action, il se ferme seul au bout de 20 s (après la lecture de la fiche),
+// en fondu, et la carte se pose doucement sur la destination.
 function finishAtEntrance(fiche) {
   stopNav();
   try { wakeLock?.release?.(); } catch { /* déjà libéré */ }
   const nav = S.nav;
-  setTimeout(() => { if (S.nav === nav && S.screen === "nav") stopGuidance(true); }, fiche ? 4000 + fiche.length * 90 : 6000);
+  nav.arrivedAt = Date.now();
+  nav.autoEndAt = Date.now() + Math.max(20000, fiche ? 6000 + fiche.length * 90 : 0);
+  const t = setInterval(() => {
+    if (S.nav !== nav || S.screen !== "nav" || nav.stayed) return clearInterval(t);
+    if (Date.now() >= nav.autoEndAt) { clearInterval(t); endGuidanceSoftly(); }
+  }, 500);
+}
+function endGuidanceSoftly() {
+  const ar = $("ar"), dest = S.dest;
+  if (ar && !ar.hidden && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    ar.classList.add("leaving");                           // fondu de la vue caméra (css : #ar.leaving)
+    setTimeout(() => { stopGuidance(true); if (dest) setTimeout(() => map.flyTo([dest.lat, dest.lon], 18, {duration: 1.2}), 150); }, 450);
+  } else { stopGuidance(true); if (dest) map.setView([dest.lat, dest.lon], 18); }
 }
 function stopGuidance(keepVoice = false) {
+  // départ « Ma position » : le prochain trajet repartira d'où vous êtes (dernière position du guidage si récente)
+  const real = S.nav?.real;
+  if (real && Date.now() - real.at <= ORIGIN_RULES.maxAgeMs) liveFix = {lat: real.lat, lon: real.lon, acc: real.acc, at: real.at};
   for (const step of [() => stopNav(), () => { S.nav = null; }, () => { if (!keepVoice) speech.clear(); },
-                      () => wakeLock?.release?.(), () => closeAR(), () => layers.progress.clearLayers(), () => go("route")]) {
+                      () => wakeLock?.release?.(), () => closeAR(), () => layers.progress.clearLayers(),
+                      () => { if (S.origin.gps) { S.originMode = "gps"; S.routes = []; locateOrigin(); } }, () => go("route"),
+                      () => { if (S.origin.gps && S.dest && !originPending()) computeRoute(); }]) {
     try { step(); } catch (e) { console.error("Arrêt du guidage :", e); }
   }
   // Si l'écran de guidage est encore là 2 s plus tard (blocage), on le libère de force
@@ -1420,14 +1724,44 @@ function renderHud() {
   h.innerHTML = body + `<div class="close">Vue lunettes (le noir est transparent) · toucher : fermer · appui long : contraste</div>`;
 }
 
+// ---- render() et animations ------------------------------------------------------------------------
+// #map et #panel sont créés une fois (index.html) : render() ne remplace que le CONTENU de #panel. Pour que
+// ce remplacement ne rejoue pas les animations : un élément animé à l'entrée porte une clé stable (data-key) et
+// ne reçoit la classe « enter » que si cette clé n'était pas à l'écran au render précédent. Le défilement de
+// #panel est conservé tant qu'on reste sur le même écran ; la position du panneau (--sheet-y, sur #panel) aussi.
+let shownKeys = new Set(), lastScreen = null;
+function markEntering(root, before) {
+  const now = new Set();
+  for (const el of root.querySelectorAll("[data-key]")) {
+    now.add(el.dataset.key);
+    if (!before.has(el.dataset.key)) el.classList.add("enter");
+  }
+  return now;
+}
+// Changement d'écran : Paramètres, Profil et Zones arrivent en glissant depuis la droite (comme une page qu'on
+// ouvre) ; au retour vers la carte, le panneau réapparaît en fondu. Rien si le téléphone réduit les animations.
+const PAGE_SCREENS = ["settings", "profile", "zones"];
+function pageTransition(panel, prev) {
+  if (!prev || prev === S.screen || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const easing = getComputedStyle(document.documentElement).getPropertyValue("--ease-sheet").trim() || "cubic-bezier(.22, 1, .36, 1)";
+  if (PAGE_SCREENS.includes(S.screen))
+    panel.animate([{transform: "translateX(36%)", opacity: 0}, {transform: "translateX(0)", opacity: 1}], {duration: 380, easing});
+  else if (PAGE_SCREENS.includes(prev) && S.screen === "route")
+    panel.animate([{opacity: 0}, {opacity: 1}], {duration: 260, easing: "ease-out"});   // (transform : réservé au panneau du bas)
+}
 function render() {
   const nav = S.screen === "nav";
   const authScreen = AUTH_SCREENS[S.screen];
-  document.body.className = authScreen ? "full auth-screen" : ["profile", "settings", "zones"].includes(S.screen) ? "full" : nav ? "nav-ar" : "sheet";
+  const typing = document.body.classList.contains("typing") && document.activeElement?.id === "q";
+  document.body.className = authScreen ? "full auth-screen" : ["profile", "settings", "zones"].includes(S.screen) ? "full" : nav ? "nav-ar" : typing ? "sheet typing" : "sheet";
   // Stickers déjà à l'écran : on garde les mêmes images d'un affichage à l'autre (recréées, elles disparaissaient
   // un instant le temps d'être redécodées : le sticker « clignotait » à chaque choix de profil)
   const keepStk = new Map([...$("panel").querySelectorAll("img.stk")].map(img => [img.className + img.getAttribute("src"), img]));
-  $("panel").innerHTML = nav ? "" : authScreen ? authScreen() : {profile: screenProfile, route: screenRoute, settings: screenSettings, zones: screenZones}[S.screen]();
+  const panel = $("panel"), scroll = lastScreen === S.screen ? panel.scrollTop : 0, prevScreen = lastScreen;
+  panel.innerHTML = nav ? "" : authScreen ? authScreen() : {profile: screenProfile, route: screenRoute, settings: screenSettings, zones: screenZones}[S.screen]();
+  shownKeys = markEntering(panel, lastScreen === S.screen ? shownKeys : new Set());
+  panel.scrollTop = scroll; lastScreen = S.screen;
+  pageTransition(panel, prevScreen);
   for (const img of $("panel").querySelectorAll("img.stk")) {
     const old = keepStk.get(img.className + img.getAttribute("src"));
     if (old) { img.replaceWith(old); keepStk.delete(img.className + img.getAttribute("src")); }
@@ -1461,6 +1795,7 @@ function render() {
     }
   } else ms?.remove();
   syncGuard();
+  syncHereDot();
   layoutSheet();
   setTimeout(() => map.invalidateSize(), 0);
 }
@@ -1547,6 +1882,7 @@ function renderNavLive() {
   const n = S.nav;
   if (!n) return;
   const shown = (n.phase === "approach" || n.away || n.offRoute) && n.real ? n.real : n.here;   // N°15 : pas accroché pendant l'approche
+  realMarker?.setLatLng?.([shown.lat, shown.lon]);         // cercle de précision autour du seul point affiché
   n.marker?.setLatLng([shown.lat, shown.lon]);
   if (S.screen === "nav") { map.panTo([shown.lat, shown.lon], {animate: false}); drawProgress(); refreshTransit(); announceStops(); }
 }
@@ -1568,6 +1904,9 @@ function drawProgress(force = false) {
   if (lit < n.total) L.polyline(routeSlice(lit, n.total), {color: C.route, weight: 5, opacity: .35, lineCap: "round", interactive: false}).addTo(layers.progress);
   L.polyline(routeSlice(n.pos, lit), {color: C.routeCase, weight: 11, opacity: .9, lineCap: "round", interactive: false}).addTo(layers.progress);
   L.polyline(routeSlice(n.pos, lit), {color: C.route, weight: 7, opacity: 1, lineCap: "round", interactive: false}).addTo(layers.progress);
+  const endPt = n.route.geometry.at(-1);
+  if (S.dest && haversineM(endPt.lat, endPt.lon, S.dest.lat, S.dest.lon) > 12)   // dernier bout à pied jusqu'à l'adresse
+    L.polyline([[endPt.lat, endPt.lon], [S.dest.lat, S.dest.lon]], {color: C.route, weight: 4, dashArray: "2 9", lineCap: "round", interactive: false}).addTo(layers.progress);
   if ((n.phase === "approach" || n.away) && n.real) {                // pointillés jusqu'au point de départ / à l'itinéraire
     const t = posAt(n.gapAlong ?? 0);
     L.polyline([[n.real.lat, n.real.lon], [t.lat, t.lon]], {color: C.route, weight: 4, dashArray: "2 9", lineCap: "round", interactive: false}).addTo(layers.progress);
@@ -1627,30 +1966,109 @@ function forward() {
 }
 function closeRoutes() {
   Object.assign(S, {dest: null, routes: [], query: "", places: [], message: null, arrival: null});
-  map.setView([S.origin.lat, S.origin.lon], 16);
+  map.setView([S.origin.lat, S.origin.lon], 16, {animate: false});
   render();
 }
+// Portes indiquées par l'usager (« Indiquer l'entrée ») : gardées sur ce téléphone, par adresse
+const DOORS_KEY = "va-doors";
+const doorKey = p => norm2(p.label || "").replace(/\s+/g, " ").trim();
+const savedDoor = p => store.get(DOORS_KEY, {})[doorKey(p)] || null;
 function chooseDest(place) {
   sheetCollapsed = false;                                 // les itinéraires doivent se voir
-  // « Jusqu'à la bonne porte » : on vise l'entrée accessible du lieu quand elle est connue (js/arrival.js)
-  const {entrance: ent, note} = net && !place.gps ? entranceFor(net, place) : {entrance: null, note: ""};
-  const viaEntrance = ent && ent.d > 8;
+  place = {...place, addrLat: place.addrLat ?? place.lat, addrLon: place.addrLon ?? place.lon};
+  // 1) porte indiquée par l'usager pour cette adresse : prioritaire
+  const door = !place.gps && savedDoor(place);
+  // 2) « Jusqu'à la bonne porte » : entrée accessible du bâtiment, pour les profils qui en ont besoin
+  //    (fauteuil, canne) ; les autres vont à l'entrée de l'adresse (js/arrival.js)
+  const needsStepFree = ["manual_wheelchair", "electric_wheelchair", "cane_or_walker"].some(m => S.mobilities.has(m));
+  const {entrance: ent, note} = net && !place.gps && !door ? entranceFor(net, place) : {entrance: null, note: ""};
+  const viaEntrance = needsStepFree && ent && ent.d > 8;
   // incohérence entrée / adresse : notée seulement en mode test (sinon chaque bâtiment voisin en produirait une)
   S.arrival = net ? arrivalFiche(net, place, viaEntrance ? ent : null, S.detectDebug ? note : "") : null;
-  S.dest = viaEntrance ? {...place, lat: ent.lat, lon: ent.lon, viaEntrance: true} : place;
+  S.dest = door ? {...place, lat: door.lat, lon: door.lon, userDoor: true}
+    : viaEntrance ? {...place, lat: ent.lat, lon: ent.lon, viaEntrance: true} : place;
+  // 3) adresse française : position « entrée » de la Base Adresse Nationale (certifiée par la commune), si elle
+  //    diffère du point renvoyé par la recherche
+  if (!door && !viaEntrance && place.banId && navigator.onLine) banEntrance(place);
   S.query = place.label; S.places = [];
-  computeRoute();                                         // tout de suite avec le départ actuel…
-  if (S.originMode === "auto") locateOrigin(true);       // …puis depuis « Ma position » dès qu'elle est connue
+  if (S.originMode === "auto") locateOrigin(true);       // départ « Ma position » (localisation demandée si besoin)
+  else if (S.originMode === "gps") locateOrigin();       // départ GPS : il doit être récent (sinon on attend)
+  computeRoute();
 }
+async function banEntrance(place) {
+  try {
+    const d = await fetch(`https://plateforme.adresse.data.gouv.fr/lookup/${encodeURIComponent(place.banId)}`).then(r => r.ok ? r.json() : null);
+    const pos = (d?.positions || []).find(p => p.positionType === "entrée")?.position?.coordinates;
+    if (!pos || S.dest?.banId !== place.banId || S.dest.userDoor) return;
+    const [lon, lat] = pos;
+    if (haversineM(lat, lon, S.dest.lat, S.dest.lon) < 5) { S.dest = {...S.dest, banEntrance: true}; return render(); }
+    S.dest = {...S.dest, lat, lon, banEntrance: true};
+    computeRoute();
+  } catch { /* hors ligne : on garde le point de la recherche */ }
+}
+// « La porte n'est pas là ? » : l'usager touche la carte à l'endroit de la porte ; elle est gardée sur ce
+// téléphone pour cette adresse et l'itinéraire est recalculé jusqu'à elle
+let pickingDoor = false;
+function pickDoor() {
+  if (!S.dest || pickingDoor) return;
+  pickingDoor = true;
+  document.body.classList.add("picking-door");
+  toast("Touchez la carte à l'endroit exact de la porte d'entrée.", 6000);
+  map.once("click", e => {
+    pickingDoor = false;
+    document.body.classList.remove("picking-door");
+    const doors = store.get(DOORS_KEY, {});
+    doors[doorKey(S.dest)] = {lat: e.latlng.lat, lon: e.latlng.lng};
+    store.set(DOORS_KEY, doors);
+    S.dest = {...S.dest, lat: e.latlng.lat, lon: e.latlng.lng, userDoor: true, viaEntrance: false, banEntrance: false};
+    toast("Entrée enregistrée : l'itinéraire vous y mène, et vous y mènera la prochaine fois.");
+    computeRoute();
+  });
+}
+function resetDoor() {
+  const doors = store.get(DOORS_KEY, {});
+  delete doors[doorKey(S.dest)];
+  store.set(DOORS_KEY, doors);
+  chooseDest({label: S.dest.label, lat: S.dest.addrLat, lon: S.dest.addrLon, type: S.dest.type, banId: S.dest.banId, addrLat: S.dest.addrLat, addrLon: S.dest.addrLon});
+}
+function doorCard() {
+  if (!S.dest || S.dest.gps) return "";
+  const where = S.dest.userDoor ? "Entrée indiquée par vous" : S.dest.viaEntrance ? "Entrée accessible du bâtiment"
+    : S.dest.banEntrance ? "Entrée officielle de l'adresse" : "Point de l'adresse";
+  return `<div class="door-card">${icon("door-open")}<span class="grow"><b>${where}</b><small>${S.dest.userDoor ? "gardée sur ce téléphone" : "la porte n'est pas là ?"}</small></span>
+    ${S.dest.userDoor ? `<button class="btn soft small" id="resetDoor">Réinitialiser</button>` : ""}
+    <button class="btn soft small" id="pickDoor">${icon("map-pin")} ${S.dest.userDoor ? "Déplacer" : "Indiquer l'entrée"}</button></div>`;
+}
+// Guidage vers un repère de la carte (entrée accessible, ERP, toilettes, ascenseur…), comme pour les arrêts
+function guideToPoint(label, lat, lon) {
+  const from = whereAmI(), dest = {label, lat, lon, type: "poi", addrLat: lat, addrLon: lon};
+  map.closePopup();
+  if (S.screen === "nav" && S.nav) { S.dest = dest; return reroute({lat: from.lat, lon: from.lon}, `Vers ${label}`, true); }
+  if (S.screen !== "route") go("route");
+  chooseDest(dest);
+}
+const guidePopup = (title, body, d) => `<div class="pp"><div class="pp-title">${esc(title)}</div>${body}
+  <div class="pp-src">${d !== null ? short(d) : ""}</div><button class="pp-guide" type="button">${icon("navigation")} M'y guider</button></div>`;
 function chooseOrigin(place) {
   S.searchFor = "dest"; S.oquery = ""; S.places = [];
-  if (place.type === "gps") { S.originMode = "gps"; render(); return locateOrigin(); }
+  if (place.type === "gps") { S.originMode = "gps"; locateOrigin(); return S.dest ? computeRoute() : render(); }
   S.origin = {lat: place.lat, lon: place.lon, label: place.label}; S.originMode = "manual";
   S.dest ? computeRoute() : render();
 }
 function cancelOrigin() { S.searchFor = "dest"; S.oquery = ""; S.places = []; render(); }
 function startGuidance() {
   unlockVoice();                                          // dans le geste de l'usager (obligatoire sur iPhone)
+  // départ « Ma position » : si vous avez bougé depuis le calcul, le trajet repart d'où vous êtes
+  if (S.origin.gps && liveFix && Date.now() - liveFix.at <= ORIGIN_RULES.maxAgeMs && liveFix.acc <= ORIGIN_RULES.acceptAccM
+      && distM(S.origin, liveFix) > 10) {
+    const label = S.routes[S.selected]?.label;
+    S.origin = {lat: liveFix.lat, lon: liveFix.lon, acc: liveFix.acc, confirmedAt: Date.now(), label: "Ma position", gps: true};
+    try {
+      const routes = computeRoutes(net, {origin: S.origin, destination: S.dest, profile: profileJson(), compare_shortest: true}, reports()).routes;
+      if (routes.length) { S.routes = routes; S.selected = Math.max(0, routes.findIndex(r => r.label === label)); }
+    } catch (e) { if (!(e instanceof RoutingError)) throw e; }
+    if (!S.routes[S.selected]?.accessible) return render();
+  }
   hazardAlerted.clear();                                  // nouveau trajet : tous les obstacles seront annoncés
   startNav(S.routes[S.selected]);
   prepareOffline(S.routes[S.selected], true);           // carte du trajet gardée : le guidage tient sans réseau
@@ -1661,6 +2079,39 @@ function startGuidance() {
   map.setView([S.nav.here.lat, S.nav.here.lon], 17, {animate: false});
 }
 // Confirmation avant de quitter un guidage par un geste (on ne l'arrête jamais par mégarde)
+// Localisation refusée : une page web n'a PAS le droit d'ouvrir les Réglages de l'iPhone (Apple le bloque hors
+// des applis natives). On affiche donc le chemin exact, adapté au téléphone et à la façon dont l'appli est ouverte,
+// puis « Réessayer » redemande la position.
+function locationHelp() {
+  if (document.querySelector(".confirm")) return;
+  const ua = navigator.userAgent, ios = /iphone|ipad|ipod/i.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const home = navigator.standalone === true || matchMedia("(display-mode: standalone)").matches, android = /android/i.test(ua);
+  const iosSettings = ["Ouvrez l'appli <b>Réglages</b> de l'iPhone", "<b>Confidentialité et sécurité</b> → <b>Service de localisation</b> : activé",
+    "Descendez jusqu'à <b>Sites web Safari</b>", "Choisissez <b>Lorsque l'app est active</b> et activez <b>Position exacte</b>"];
+  const steps = ios && !home ? ["Dans Safari, touchez <b>aA</b> (ou l'icône à gauche de l'adresse)", "<b>Réglages du site web</b> → <b>Position</b> → <b>Autoriser</b>",
+      "Si « Position » n'apparaît pas : faites les réglages ci-dessous"] .concat(iosSettings)
+    : ios ? iosSettings
+    : android ? ["Touchez le <b>cadenas</b> (ou ⓘ) à gauche de l'adresse, en haut", "<b>Autorisations</b> → <b>Position</b> → <b>Autoriser</b>",
+      "Vérifiez aussi : Paramètres du téléphone → <b>Localisation</b> activée"]
+    : ["Ouvrez les <b>réglages du site</b> (icône à gauche de l'adresse)", "<b>Position</b> → <b>Autoriser</b>"];
+  const el = document.createElement("div");
+  el.className = "confirm";
+  el.innerHTML = `<div class="confirm-box loc-help" role="alertdialog" aria-modal="true" aria-labelledby="lh">
+    <h3 id="lh">${icon("map-pin")} Autoriser la localisation</h3>
+    <p class="fine">Vision AR a besoin de votre position pour vous guider. Elle reste sur votre téléphone.</p>
+    <ol>${steps.map(t => `<li>${t}</li>`).join("")}</ol>
+    <div class="actions"><button class="btn soft" data-c="close">Fermer</button><button class="btn dark" data-c="retry">${icon("locate-fixed")} Réessayer</button></div></div>`;
+  el.onclick = e => {
+    const c = e.target.closest("[data-c]")?.dataset.c;
+    if (!c && e.target !== el) return;
+    el.remove();
+    if (c !== "retry") return;
+    if (S.nav) { S.nav.gpsDenied = false; S.nav.gpsProblem = null; startGps(); renderNavLive(); }
+    else { geoPermission = "unknown"; S.originMode = "gps"; locateOrigin(); if (S.dest) computeRoute(); }   // réglage peut-être changé
+  };
+  document.body.append(el);
+  el.querySelector("[data-c=retry]").focus();
+}
 function confirmQuit() {
   if (document.querySelector(".confirm")) return;          // une seule confirmation à la fois
   const el = document.createElement("div");
@@ -1746,12 +2197,16 @@ function bind() {
   // la croix efface tout d'un coup ; mousedown empêché : le champ garde le clavier ouvert
   on("qClear", "onmousedown", e => e.preventDefault());
   on("qClear", "onclick", () => { const q = $("q"); q.value = ""; S.query = ""; $("qClear").hidden = true; search(""); q.focus(); });
-  on("q", "onfocus", () => { if (sheetCollapsed) setSheet(false); });
+  on("q", "onfocus", () => { document.body.classList.add("typing"); if (sheetCollapsed) setSheet(false); else layoutSheet(); });
+  // (petit délai : un toucher sur une suggestion doit arriver avant que le panneau reprenne sa hauteur normale)
+  on("q", "onblur", () => setTimeout(() => { if (document.activeElement?.id !== "q") { document.body.classList.remove("typing"); layoutSheet(); } }, 300));
   on("sheetHandle", "onkeydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setSheet(!sheetCollapsed); } });
   bindPlaces(document);
   on("favToggle", "onclick", toggleFavorite);
   on("arrSpeak", "onclick", () => say(arrivalSpeech(S.arrival), true));
   all("[data-route]", c => c.onclick = () => { S.selected = +c.dataset.route; render(); });
+  on("pickDoor", "onclick", pickDoor);
+  on("resetDoor", "onclick", resetDoor);
   all("[data-indoor]", b => b.onclick = () => openBuilding(b.dataset.indoor));
   on("start", "onclick", startGuidance);
   // Paramètres
@@ -1835,7 +2290,24 @@ const loaderStart = performance.now();
 function hideLoader() {
   const l = $("loader");
   if (!l) return;
-  setTimeout(() => { l.classList.add("done"); setTimeout(() => l.remove(), 500); }, Math.max(0, 1200 - (performance.now() - loaderStart)));
+  setTimeout(() => { l.classList.add("done"); appIntro(); setTimeout(() => l.remove(), 500); }, Math.max(0, 1200 - (performance.now() - loaderStart)));
+}
+// Ouverture de l'appli, pendant que l'écran de chargement s'efface : la carte se pose (léger zoom arrière), le
+// panneau monte du bas jusqu'à sa place, puis son contenu apparaît élément par élément. Rien si le téléphone
+// demande de réduire les animations. (Le panneau garde sa position habituelle : l'animation part de sous
+// l'écran et revient exactement à son décalage --sheet-y.)
+function appIntro() {
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const easing = "cubic-bezier(.22, 1, .36, 1)", panel = $("panel");
+  if (getComputedStyle($("map")).visibility !== "hidden")
+    $("map").animate([{opacity: 0.2, transform: "scale(1.08)"}, {opacity: 1, transform: "scale(1)"}], {duration: 1100, easing});
+  const sheetY = parseFloat(panel.style.getPropertyValue("--sheet-y")) || 0;
+  panel.animate([{transform: "translateY(100%)"}, {transform: `translateY(${sheetY}px)`}], {duration: 750, easing});
+  [...panel.children].slice(0, 8).forEach((el, i) => el.animate(
+    [{opacity: 0, transform: "translateY(16px)"}, {opacity: 1, transform: "none"}],
+    {duration: 520, delay: 220 + i * 80, easing, fill: "backwards"}));
+  for (const b of [$("mapSettings"), $("mapClose")]) b?.animate([{opacity: 0, transform: "scale(.6)"}, {opacity: 1, transform: "none"}],
+    {duration: 450, delay: 500, easing, fill: "backwards"});
 }
 fetch(ZONE.data).then(r => r.json()).then(data => {
   net = loadNetwork(data);
@@ -1853,4 +2325,7 @@ fetch(ZONE.data).then(r => r.json()).then(data => {
 
 // Accès pour les tests automatiques uniquement (adresse terminée par ?debug)
 if (new URLSearchParams(location.search).has("debug"))
-  window.__va = {S, posAt, navState, moveTo, chooseDest, get net() { return net; }, get transit() { return transit; }, addReport, reports, navApi};
+  window.__va = {S, posAt, navState, moveTo, chooseDest, get net() { return net; }, get transit() { return transit; }, addReport, reports, navApi,
+    useFavorite, stopGuidance, get liveFix() { return liveFix; }, get geoPermission() { return geoPermission; },
+    resetOrigin() { stopHereWatch(); liveFix = null; wantOrigin = false; originState = {searchSince: null, best: null, lastUseAt: null};
+      S.origin = {...MAIRIE}; S.originMode = "auto"; S.originNeedsFix = false; S.dest = null; S.routes = []; render(); }};
