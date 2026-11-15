@@ -17,6 +17,8 @@ import {haversineM} from "./routing.js";
 import {icon, ICONS} from "./icons.js";
 import {sticker, stickerPop} from "./stickers.js";
 import {BACKEND, captureSample, detect, lastLuma, loadModel, modelReady} from "./obstacles.js";
+import {creerReleve} from "./survey.js";
+import {recentrage} from "./ribbon.js";
 import {CORRIDOR, DIST_CALIB, MAX_SHOWN, TRAPEZE, corridor2D, halfAt, makeTracker, nextAnnouncement} from "./corridor.js";
 import {angleDiff, makeHeadingFusion} from "./heading.js";
 
@@ -25,7 +27,9 @@ const PHONE_HEIGHT_M = {standing: 1.35, wheelchair: 1.05};
 const CAMERA_LONG_FOV_DEG = 68;   // champ de la caméra arrière principale sur le grand côté de l'image (iPhone ≈ 69°, Android 65-70°)
 const VFOV_DEG = 62;              // sans image vidéo (ordinateur)
 const AHEAD_M = 55;               // portée des repères (obstacles, bordures, marches)
-const PATH_AHEAD_M = 15;          // le ruban ne montre que les 15 m devant soi (retour terrain : au-delà, il flottait)
+const PATH_AHEAD_M = 15;          // le ruban ne montre que les 15 m devant soi (retour terrain : au-delà, il flottait)…
+const TURN_AFTER_M = 8;           // … sauf à l'approche d'un virage : jusqu'à 8 m après lui (on voit le tournant)
+const TAIL_M = 4;                 // le dernier bout du ruban s'efface, dans le sens du chemin
 const PLACES_M = 50;              // portée des étiquettes de lieux, par défaut (réglable dans les Paramètres : 20 à 130 m)
 const NEAR_M = 0.6;
 const BEHIND_M = 4;              // le ruban part de sous les pieds
@@ -67,7 +71,7 @@ let arrivalCheered = false;
 let api = null, root = null, video = null, canvas = null, ctx = null, stream = null, raf = 0, noCamera = false;
 let sensors = {heading: null, pitch: null, roll: 0}, mapFull = false, sheet = null, domeGeom = null, domeObserver = null;
 let camHeight = PHONE_HEIGHT_M.standing, view = null;     // view : origine et position lissées
-let blocking = true, sheetMessage = null, lastUi = "";
+let blocking = true, sheetMessage = null, lastUi = "", uiParts = {};
 // Détection d'obstacles (N°5, N°17, N°18)
 let dets = [], detsAt = 0, detBusy = false, detState = "", lastPitch = 10, lastAutoSample = 0;
 // Couloir de marche (js/corridor.js) : suivi des obstacles d'une image à l'autre, annonces une seule fois
@@ -164,7 +168,7 @@ class OneEuro {
 // Cap boussole seule (appli Android, démonstration) : très lissé. Inclinaison et roulis viennent déjà du gyroscope
 // (lisses et sans retard) : un lissage léger suffit. Lourdement lissés (0,25 Hz, v66), le ruban suivait l'image
 // avec du retard quand on inclinait le téléphone : il semblait flotter au lieu d'être posé au sol.
-const F = {heading: new OneEuro(0.15, 0.006, true), pitch: new OneEuro(2.5, 0.05), roll: new OneEuro(2.5, 0.05)};
+const F = {heading: new OneEuro(0.15, 0.006, true), route: new OneEuro(0.8, 0.02, true), pitch: new OneEuro(2.5, 0.05), roll: new OneEuro(2.5, 0.05)};
 let lastHeading = 0, drawnH = null, drawnP = null;
 async function startSensors() {
   try {
@@ -264,40 +268,54 @@ function bandPath(left, right) {
 }
 function drawPath(cam, s, here, pos) {
   const t = theme(), dpr = devicePixelRatio;
-  const raw = [], from = Math.max(0, pos - BEHIND_M), to = Math.min(s.nav.total, pos + PATH_AHEAD_M);
-  for (let d = from; d < to; d += 1.5) raw.push(enu(here, s.posAt(d)));
-  raw.push(enu(here, s.posAt(to)));
+  // Jusqu'où : 15 m devant soi ; à l'approche d'un virage (moins de 22 m), jusqu'à 8 m APRÈS lui. On voit le
+  // tournant avant d'y être, et la nouvelle rue est déjà dessinée quand on se tourne vers elle.
+  const turnAt = s.nav.stepAt?.[s.st.idx + 1];
+  const reach = Math.min(30, Math.max(PATH_AHEAD_M, turnAt != null && turnAt > pos ? turnAt - pos + TURN_AFTER_M : 0));
+  const raw = [], from = Math.max(0, pos - BEHIND_M), to = Math.min(s.nav.total, pos + reach);
+  lastReach = to - pos;
+  // Le ruban est ramené sous les pieds : sans ça, une erreur de GPS de trois mètres le pose
+  // sur le mur ou sur la chaussée (captures du 14/11/2026). Au-delà de 6 m, l'écart reste
+  // visible : ce n'est plus une imprécision, c'est qu'on n'est pas sur le chemin. js/ribbon.js
+  const dec = recentrage(enu(here, s.posAt(pos)));
+  const au = d => { const q = enu(here, s.posAt(d)); q.x -= dec.x; q.y -= dec.y; return q; };
+  for (let d = from; d < to; d += 1.5) raw.push(au(d));
+  raw.push(au(to));
   if (raw.length < 3) return;
   const pts = chaikin(raw);
-  const [left, right] = bandEdges(cam, pts, t.half);
-  if (left.length < 2) return;
-  const yNear = Math.max(left[0][1], right[0][1]), yFar = Math.min(left.at(-1)[1], right.at(-1)[1]);
-  const fade = (c0, c1, c2) => {                          // opaque devant soi, transparent au loin
-    const g = ctx.createLinearGradient(0, yNear, 0, Math.min(yNear - 1, yFar));
-    g.addColorStop(0, c0); g.addColorStop(0.55, c1); g.addColorStop(1, c2);
+  // Le ruban est plein jusqu'à ses 4 derniers mètres, qui s'effacent dans le sens du chemin. (Avant : fondu du bas
+  // vers le haut de l'écran ; la rue d'après un virage, à la même hauteur que l'horizon, était presque invisible.)
+  const cum = [0];
+  for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y));
+  const cut = Math.max(1, cum.findIndex(c => c >= cum.at(-1) - TAIL_M));
+  const main = pts.slice(0, cut + 1), tail = pts.slice(cut);
+  const tailFill = (l, r, rgb, a, rgbEnd = rgb) => {
+    const mid = k => [(l[k][0] + r[k][0]) / 2, (l[k][1] + r[k][1]) / 2], [x0, y0] = mid(0), [x1, y1] = mid(l.length - 1);
+    const g = ctx.createLinearGradient(x0, y0, x1 === x0 && y1 === y0 ? x0 + 1 : x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgbEnd},0)`);
     return g;
+  };
+  const band = (half, rgb, a, rgbEnd) => {               // une couche : partie pleine, puis bout qui s'efface
+    const [lm, rm] = bandEdges(cam, main, half), [lt, rt] = bandEdges(cam, tail, half);
+    if (lm.length > 1) { bandPath(lm, rm); ctx.fillStyle = `rgba(${rgb},${a})`; ctx.fill(); }
+    if (lt.length > 1) { bandPath(lt, rt); ctx.fillStyle = tailFill(lt, rt, rgb, a, rgbEnd); ctx.fill(); }
+    return [lm, rm, lt, rt];
+  };
+  const stroke = (p, style) => {
+    if (p.length < 2) return;
+    ctx.strokeStyle = style; ctx.beginPath(); p.forEach(([x, y], k) => k ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.stroke();
   };
   ctx.save();
   if (t.ribbon) {
-    // Ruban posé au sol comme une bande collée : plus de grand halo lumineux (il le faisait flotter au-dessus de la
-    // rue), mais un liseré sombre AU SOL (7 cm de chaque côté, en perspective comme le ruban) qui le détache du
-    // trottoir, puis le ruban turquoise et son cœur clair
-    const [ol, or] = bandEdges(cam, pts, t.half + 0.07);
-    if (ol.length > 1) { bandPath(ol, or); ctx.fillStyle = fade("rgba(0,40,52,.42)", "rgba(0,40,52,.24)", "rgba(0,40,52,0)"); ctx.fill(); }
-    bandPath(left, right);
-    ctx.fillStyle = fade("rgba(0,174,204,.82)", "rgba(20,190,200,.62)", "rgba(61,220,151,0)");
-    ctx.fill();
-    const [cl, cr] = bandEdges(cam, pts, t.half * 0.35);
-    if (cl.length > 1) { bandPath(cl, cr); ctx.fillStyle = fade("rgba(200,255,240,.55)", "rgba(170,250,225,.35)", "rgba(61,220,151,0)"); ctx.fill(); }
-    ctx.lineWidth = 1.5 * dpr; ctx.strokeStyle = fade("rgba(255,255,255,.75)", "rgba(255,255,255,.35)", "rgba(255,255,255,0)");
-    ctx.beginPath(); left.forEach(([x, y], k) => k ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.stroke();
-    ctx.beginPath(); right.forEach(([x, y], k) => k ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.stroke();
-  } else {
-    // léger halo au sol sous les chevrons (maquette 2)
-    bandPath(left, right);
-    ctx.fillStyle = fade("rgba(91,224,234,.16)", "rgba(91,224,234,.08)", "rgba(91,224,234,0)");
-    ctx.fill();
-  }
+    // Ruban posé au sol comme une bande collée : pas de grand halo (il le faisait flotter au-dessus de la rue), un
+    // liseré sombre AU SOL (7 cm de chaque côté, en perspective) qui le détache du trottoir, le ruban, son cœur clair
+    band(t.half + 0.07, "0,40,52", .36);
+    const [lm, rm, lt, rt] = band(t.half, "0,174,204", .78, "61,220,151");
+    band(t.half * 0.35, "200,255,240", .45);
+    ctx.lineWidth = 1.5 * dpr;
+    stroke(lm, "rgba(255,255,255,.7)"); stroke(rm, "rgba(255,255,255,.7)");
+    if (lt.length > 1) { const g = tailFill(lt, rt, "255,255,255", .7); stroke(lt, g); stroke(rt, g); }
+  } else band(t.half, "91,224,234", .13);                // néon : léger halo au sol sous les chevrons
   ctx.restore();
 
   // Chevrons « ^ » peints au sol le long de la ligne lissée, à intervalle régulier (halo réduit : ils restent au sol)
@@ -306,7 +324,7 @@ function drawPath(cam, s, here, pos) {
   ctx.shadowColor = t.glow; ctx.shadowBlur = (t.ribbon ? 0 : 10) * dpr;
   // chevrons ancrés à l'itinéraire (ils ne glissent pas avec soi) : ils approchent, puis s'effacent sous les pieds
   let acc = 0, next = Math.ceil((pos - 1.5) / t.chevGap) * t.chevGap - from;
-  const wave = (performance.now() / 1000 * 7) % (PATH_AHEAD_M + 6) - 1;   // onde lumineuse, de soi vers l'avant
+  const ahead = to - pos, wave = (performance.now() / 1000 * 7) % (ahead + 6) - 1;   // onde lumineuse, de soi vers l'avant
   for (let i = 1; i < pts.length; i++) {
     const a = pts[i - 1], b = pts[i], seg = Math.hypot(b.x - a.x, b.y - a.y);
     if (!seg) continue;
@@ -320,7 +338,7 @@ function drawPath(cam, s, here, pos) {
         const along = next - (pos - from);               // distance devant soi
         const passed = along < CHEV_START_M ? Math.max(0, (along + 1.5) / (CHEV_START_M + 1.5)) : 1;
         const pulse = Math.exp(-((along - wave) ** 2) / 3);
-        const alpha = passed * Math.max(0, 1 - along / PATH_AHEAD_M) ** 0.8 * (0.5 + 0.5 * pulse);
+        const alpha = passed * Math.max(0, Math.min(1, (ahead - along) / TAIL_M)) * (0.55 + 0.45 * pulse);   // pleins jusqu'au bout
         ctx.strokeStyle = `rgba(${t.chevRGB},${alpha.toFixed(3)})`;
         ctx.lineWidth = Math.max(1.5 * dpr, Math.min(16 * dpr, cam.scale(q[1].d) * t.chevStroke));
         ctx.beginPath();
@@ -618,6 +636,7 @@ function runDetection(s) {
     tracker.update(dets.filter(d => d.alert && d.score >= minScore && d.ground), detsAt);
     obstacleAlerts(s);
     autoSample(s);
+    surveySample(s);
   }).catch(() => {}).finally(() => { detBusy = false; });
 }
 // Alerte (voix + vibration) : obstacle confirmé dans le couloir, une seule fois, le plus proche d'abord,
@@ -651,6 +670,18 @@ function autoSample(s) {
   if (!dets.some(d => d.alert && d.score >= 0.3 && d.score < 0.5)) return;
   lastAutoSample = performance.now();
   captureSample(video, {kind: "faible_confiance", detections: dets, meta: sampleMeta(s)}).catch(() => {});
+}
+// Relevé systématique : une image tous les 25 m (10 m après un virage), pour constituer la base
+// d'images de référence. La décision est dans js/survey.js, testée ; ici on ne fait que l'appliquer.
+const releve = creerReleve();
+function surveySample(s) {
+  if (!s.dataConsent || !s.survey) return;
+  const r = s.nav.real;
+  if (!r) return;
+  const fix = {lat: r.lat, lon: r.lon, acc: r.acc, cap: lastHeading ?? -1, at: Date.now()};
+  if (!releve.decider(fix).capturer) return;
+  releve.noter(fix);
+  captureSample(video, {kind: "releve", detections: dets, meta: sampleMeta(s)}).catch(() => {});
 }
 function sampleMeta(s) {
   const r = s.nav.real;
@@ -752,7 +783,8 @@ function frame() {
   // démonstration : la vue suit le sens du trajet (pas la boussole du téléphone, qui n'est pas dans la rue simulée)
   const now = performance.now(), nh = nativeHeading(), compass = !s.simulated && (nh !== null || sensors.heading !== null);
   // boussole du téléphone : cap fusionné, sans lissage (il suivrait l'image en retard) ; sinon cap lissé
-  const heading = nh !== null ? F.heading.filter(nh, now) : compass ? sensors.heading : F.heading.filter(routeBearing(s), now);
+  // (démonstration : sens du trajet, lissé juste assez pour tourner en douceur aux virages, sans traîner)
+  const heading = nh !== null ? F.heading.filter(nh, now) : compass ? sensors.heading : F.route.filter(routeBearing(s), now);
   lastHeading = heading; drawnH = sensors.heading ?? heading; drawnP = sensors.pitch ?? 0;
   document.documentElement.style.setProperty("--heading", `${heading.toFixed(1)}deg`);
   const pitch = F.pitch.filter(Math.max(-30, Math.min(80, sensors.pitch ?? 10)), now);   // sans capteur : téléphone presque droit
@@ -822,18 +854,33 @@ let hiddenAt = 0;
 // À l'écart du tracé (à l'intérieur, de l'autre côté de la rue, hors itinéraire), la vraie position GPS :
 // le ruban reste à sa vraie place dans la rue et des pointillés montrent comment le rejoindre.
 // Glissement lent entre deux mesures GPS pour que les lignes ne sautent pas.
-let lastView = 0;
+let lastView = 0, lastReach = 0;
+// Sur l'itinéraire, le ruban part de sous les pieds, sans retard : la position est prolongée au rythme de la marche
+// entre deux mesures GPS (au plus 1,5 s, une mesure arrive normalement chaque seconde), et reste SUR le tracé.
+// Avant : glissement de 1,6 s en ligne droite (en coupant les virages) ; en marchant puis en tournant, le ruban
+// partait d'un point resté en arrière : il apparaissait sur le côté puis revenait vers le centre (simulateur, 25/10).
+function predictedPos(n) {
+  const lf = n.lastFix, v = n.walkSpeed ?? 0;
+  if (n.phase !== "route" || n.arrived || !lf || v < 0.3) return n.pos;
+  const ahead = v * Math.min(1.5, Math.max(0, (Date.now() - lf.at) / 1000));
+  return Math.min(n.total, Math.max(n.pos, lf.along + ahead));
+}
 function viewpoint(s) {
   const n = s.nav, fresh = n.real && Date.now() - n.real.at < 15000;
   const away = !!(fresh && (n.offRoute || n.away));
-  const target = away ? {lat: n.real.lat, lon: n.real.lon} : s.posAt(n.pos);
-  const now = performance.now(), k = 1 - Math.exp(-Math.min(1, (now - lastView) / 1000) / 1.6);
+  const now = performance.now(), dt = Math.min(1, (now - lastView) / 1000);
   lastView = now;
-  // Glissement doux, y compris quand on passe de « sur l'itinéraire » à « à l'écart » : plus de saut du tracé
-  if (!view || haversineM(view.here.lat, view.here.lon, target.lat, target.lon) > 60) view = {here: {...target}, pos: n.pos};
-  else {
-    view.here = {lat: view.here.lat + (target.lat - view.here.lat) * k, lon: view.here.lon + (target.lon - view.here.lon) * k};
-    view.pos += (n.pos - view.pos) * k;
+  if (away) {
+    // à l'écart de l'itinéraire : la vraie position GPS, en glissant (elle saute de plusieurs mètres)
+    const target = {lat: n.real.lat, lon: n.real.lon}, k = 1 - Math.exp(-dt / 0.8);
+    if (!view || view.mode !== "away" || haversineM(view.here.lat, view.here.lon, target.lat, target.lon) > 60)
+      view = {mode: "away", here: {...target}, pos: n.pos};
+    else view.here = {lat: view.here.lat + (target.lat - view.here.lat) * k, lon: view.here.lon + (target.lon - view.here.lon) * k};
+  } else {
+    const p = predictedPos(n);
+    if (!view || view.mode !== "route" || Math.abs(p - view.pos) > 8) view = {mode: "route", pos: p};
+    else view.pos += (p - view.pos) * (1 - Math.exp(-dt / 0.2));   // très court : absorbe les petites corrections du GPS
+    view.here = s.posAt(view.pos);
   }
   view.join = away ? s.posAt(n.gapAlong ?? n.pos) : null;
   return view;
@@ -878,7 +925,7 @@ function renderUi(s, heading, compass) {
   const shownAlerts = next.alerts.filter(a => !a.startsWith("Traversée") && a !== "Données à confirmer");
   const rer = s.nav.rerouted && Date.now() - s.nav.rerouted.at < 10000 ? s.nav.rerouted : null;
   const haz = s.nav.hazard && Date.now() - s.nav.hazard.at < 6000 ? s.nav.hazard : null;   // alerte de proximité : 6 s à l'écran
-  const banner = haz ? `<div class="banner danger" role="alert">${icon(haz.ic)}<span><b>${esc(haz.label)}</b> à ${haz.dist} m, ${esc(haz.where)}</span></div>`
+  const banner = haz ? `<div class="banner danger" role="alert">${icon(haz.ic)}<span><b>${esc(haz.label)}</b> dans ${haz.dist} m, ${esc(haz.where)}${haz.extent ? ` · sur ${haz.extent} m` : ""}</span></div>`
     : rer ? `<div class="banner danger">${icon("triangle-alert")}<span><b>${esc(rer.title)}</b> Itinéraire recalculé</span></div>`
     : s.gpsProblem && s.gpsDenied ? `<button class="banner warn banner-btn" data-act="gps-help">${icon("map-pin")}<span>${esc(s.gpsProblem)}</span>${icon("chevron-right")}</button>`
     : s.gpsProblem ? `<div class="banner warn">${icon("map-pin")}<span>${esc(s.gpsProblem)}</span></div>`
@@ -886,8 +933,12 @@ function renderUi(s, heading, compass) {
   const alt = s.alt;
   if (st.arrived && !arrivalCheered) { arrivalCheered = true; stickerPop("bien-arrive", 2400); }   // une seule fois par trajet
   if (!st.arrived) arrivalCheered = false;
-  const html = `
-    <div class="top">
+  // L'écran est découpé en parties mises à jour séparément. La consigne et les pastilles changent à chaque mètre ;
+  // les boutons (Réduire, barre du bas, fenêtres) ne sont recréés que si LEUR contenu change. Avant, tout l'écran
+  // était remplacé à chaque changement de texte : un toucher qui tombait à ce moment-là était perdu (« Réduire »
+  // sans effet pendant le chargement du détecteur, tests du 25/10 ; en marchant, à chaque mètre).
+  const parts = {
+    info: `
       <div class="chips">${chip("c-steps", "stairs", "Marches", r.steps_count)}${chip("c-eta", "clock", st.arrived ? "Arrivée" : `Arrivée ${eta}`, st.arrived ? eta : minsLeft)}${chip("c-dist", "route", "Distance", dist(st.remaining))}</div>
       <div class="bubble"><i class="bubble-ic">${icon(manIcon)}</i>
         <div class="bubble-txt"><b>${esc(title)}</b><span>${esc(subText)}</span>
@@ -899,27 +950,39 @@ function renderUi(s, heading, compass) {
         ${s.detect && !nativeOn && detState === "loading" ? `<em class="arrow-note">${icon("scan-eye")} Chargement du détecteur d'obstacles…</em>` : ""}
         ${s.detect && !nativeOn && detState === "error" ? `<em>${icon("triangle-alert")} Détecteur d'obstacles indisponible (connexion ?)</em>` : ""}
         ${!st.arrived && !approach && !joining && shownAlerts.length ? `<em>${icon("triangle-alert")} ${esc(shownAlerts.join(" · "))}</em>` : ""}</div>
-        ${away ? `<strong class="bubble-dist">${away}</strong>` : ""}${st.arrived ? sticker("bien-arrive", "stk-arrive") : ""}</div>
-      ${banner}
-    </div>
+        ${away ? `<strong class="bubble-dist">${away}</strong>` : ""}${st.arrived ? sticker("bien-arrive", "stk-arrive") : ""}</div>`,
+    banner,
+    dome: `
     <div class="dome-credit" aria-hidden="true">© OpenStreetMap · OpenFreeMap · OpenMapTiles</div>
     <div class="dome-ui">
       ${alt ? `<div class="alt-note">${esc(alt)}</div>` : ""}
       <button class="mini" data-act="minimize" aria-label="Réduire : retour au plan, le guidage continue à la voix">${icon("chevron-down")}<span aria-hidden="true">Réduire</span></button>
       <div class="rose ${compass ? "on" : ""}" role="img" aria-label="${compass ? "Boussole active" : "Boussole indisponible : la vue suit le sens de l'itinéraire"}">
         <span class="needle"></span><i>N</i></div>
-    </div>
+    </div>`,
+    dock: `
     <nav class="dock" aria-label="Commandes du guidage">
       <button class="round" data-act="settings" aria-label="Réglages du guidage">${icon("sliders-horizontal")}<span aria-hidden="true">Réglages</span></button>
       <button class="pill" data-act="map">${icon(mapFull ? "camera" : "map")}<span>${mapFull ? "Caméra" : "Plan"}</span></button>
       <button class="center" data-act="report" aria-label="Signaler un obstacle">${icon("triangle-alert")}</button>
       <button class="pill stop" data-act="ask-stop" aria-label="Arrêter le guidage">${icon("x")}<span>Arrêter</span></button>
       <button class="round" data-act="voice" aria-label="${s.voice ? "Couper la voix" : "Activer la voix"}">${icon(s.voice ? "volume-2" : "volume-x")}<span aria-hidden="true">${s.voice ? "Son" : "Muet"}</span></button>
-    </nav>
+    </nav>`,
+    over: `
     ${st.arrived && s.nav.arrivedAt && !s.nav.stayed && !sheet ? arrivalPanel(s) : ""}
-    ${sheet ? `<div class="scrim" data-act="close-sheet"></div><section class="sheet" role="dialog" aria-modal="true">${sheet === "settings" ? settingsSheet(s) : sheet === "stop" ? stopSheet() : reportSheet()}</section>` : ""}`;
+    ${sheet ? `<div class="scrim" data-act="close-sheet"></div><section class="sheet" role="dialog" aria-modal="true">${sheet === "settings" ? settingsSheet(s) : sheet === "stop" ? stopSheet() : reportSheet()}</section>` : ""}`,
+  };
   const ui = root.querySelector(".ar-ui");
-  if (html !== lastUi) { ui.innerHTML = html; lastUi = html; }
+  if (!ui.querySelector("[data-part]")) {                  // squelette fixe (display: contents : mise en page inchangée)
+    ui.innerHTML = `<div class="top"><div class="ar-part" data-part="info"></div><div class="ar-part" data-part="banner"></div></div>
+      <div class="ar-part" data-part="dome"></div><div class="ar-part" data-part="dock"></div><div class="ar-part" data-part="over"></div>`;
+    uiParts = {};
+  }
+  for (const [k, h] of Object.entries(parts)) if (uiParts[k] !== h) { ui.querySelector(`[data-part="${k}"]`).innerHTML = h; uiParts[k] = h; }
+  lastUi = "affiché";
+  // état du GPS dans la fenêtre Réglages : texte mis à jour seul, sans recréer les interrupteurs à chaque position
+  const gps = ui.querySelector('[data-live="gps"]'), gpsText = s.gpsStatus || "Recherche de votre position…";
+  if (gps && gps.textContent !== gpsText) gps.textContent = gpsText;
   // VoiceOver / TalkBack : la consigne n'est lue que lorsqu'elle CHANGE (avant, la bulle était relue à chaque
   // mètre parcouru). Les dangers passent par le bandeau « alert » et par la voix de l'appli (js/speech.js).
   const live = root.querySelector(".ar-live"), said = `${title}. ${subText}`;
@@ -1001,7 +1064,7 @@ function settingsSheet(s) {
     `<button data-act="${act}" data-v="${v}" class="${cur === v ? "on" : ""}">${ic ? icon(ic) : ""}${l}</button>`).join("")}</div>`;
   return `<div class="sheet-head"><h3>${icon("sliders-horizontal")} Réglages du guidage</h3><button class="x" data-act="close-sheet" aria-label="Fermer">${icon("x")}</button></div>
     <p class="sheet-label">Ma position</p>
-    <div class="gps-state">${icon("locate-fixed")}<span>${esc(s.gpsStatus || "Recherche de votre position…")}</span></div>
+    <div class="gps-state">${icon("locate-fixed")}<span data-live="gps"></span></div>
     <button class="btn soft" data-act="reroute">${icon("rotate-ccw")} Recalculer l'itinéraire</button>
     <p class="sheet-label">Vibrations de direction</p>
     <label class="setting">${icon("vibrate")}<span class="grow">Vibrer pour indiquer la direction</span>
@@ -1185,4 +1248,5 @@ export function closeAR() {
 export const arOpen = () => root && !root.hidden;
 // Tests automatiques uniquement (adresse terminée par ?debug) : état des capteurs et des étiquettes
 if (new URLSearchParams(location.search).has("debug"))
-  globalThis.__ar = {get sensors() { return sensors; }, get obs() { return obs; }, get labels() { return [...labelSmooth]; }, compassOk, get ribbonA() { return ribbonA; }};
+  globalThis.__ar = {get sensors() { return sensors; }, get obs() { return obs; }, get labels() { return [...labelSmooth]; }, compassOk, get ribbonA() { return ribbonA; },
+    get view() { return view; }, get reach() { return lastReach; }};

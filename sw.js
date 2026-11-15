@@ -5,7 +5,7 @@
 // (/vision-ar-presentation/), publiées par scripts/publier_stable.py. Chacun a ses propres caches et n'efface que les siens.
 const SITE = new URL(self.location.href).pathname.split("/")[1] || "";
 const PREFIX = {"vision-ar": "va-stable-", "vision-ar-presentation": "va-pres-"}[SITE] || "vision-ar-";
-const VERSION = PREFIX + "v97";
+const VERSION = PREFIX + "v107";
 // Cartes et bibliothèques gardées pour le hors-ligne : un cache à part, qui SURVIT aux mises à jour de l'appli
 // (avant, chaque nouvelle version effaçait les cartes déjà téléchargées)
 const MAP_CACHE = PREFIX + "cartes", MAX_MAP = 4000;
@@ -15,7 +15,7 @@ const MODEL_CACHE = PREFIX + "modeles";
 // Fichiers qui ne changent jamais (versions figées, tuiles datées) : le cache d'abord, le réseau sinon
 const STATIC_HOSTS = ["cdn.jsdelivr.net", "storage.googleapis.com", "tfhub.dev", "www.kaggle.com"];
 const APP = [
-  "./", "index.html", "manifest.webmanifest", "css/app.css", "js/app.js", "js/routing.js", "js/ar.js", "js/icons.js", "js/auth.js", "js/stickers.js", "js/arrival.js", "js/corridor.js", "js/speech.js", "js/features.js", "js/yolo.js", "js/detector-worker.js", "js/categories.js", "js/origin.js", "js/compare.js", "js/compass.js", "js/heading.js", "data/gennevilliers.acces.json",
+  "./", "index.html", "manifest.webmanifest", "css/app.css", "js/app.js", "js/routing.js", "js/ar.js", "js/icons.js", "js/auth.js", "js/stickers.js", "js/arrival.js", "js/corridor.js", "js/speech.js", "js/features.js", "js/yolo.js", "js/detector-worker.js", "js/categories.js", "js/origin.js", "js/compare.js", "js/compass.js", "js/heading.js", "js/nearby.js", "js/survey.js", "js/ribbon.js", "js/upload.js", "js/voices.js", "js/voice-worker.js", "voices/hermes.wav", "voices/selena.wav", "data/gennevilliers.acces.json",
   "img/geomessen.png", "img/vision-ar-logo.png", "img/stickers/salut.webp", "img/stickers/zero-marche.webp", "img/stickers/je-te-guide.webp", "img/stickers/ca-vibre.webp", "img/stickers/pente-douce.webp", "img/stickers/obstacle-signale.webp", "img/stickers/bien-arrive.webp", "img/stickers/vision-ar.webp", "img/stickers/bordure-abaissee.webp", "img/stickers/on-y-va.webp", "img/stickers/lis-sans-son.webp", "img/stickers/merci.webp", "img/geomessen-blanc.png", "img/auth-bg.jpg", "img/accueil.jpg",
   "fonts/atkinson-hyperlegible-400.woff2", "fonts/atkinson-hyperlegible-700.woff2", "icons/maskable-512.png",
   "data/gennevilliers.json", "data/transit.json", "js/transit.js", "js/obstacles.js", "js/zones.js", "data/ouaga2000.json", "data/ouaga2000.transit.json", "vendor/leaflet/leaflet.min.js", "vendor/leaflet/leaflet.min.css",
@@ -67,8 +67,12 @@ self.addEventListener("fetch", e => {
     e.respondWith(fetch(e.request).then(res => { if (res.ok) keepMap(e.request, res.clone()); return res; })
       .catch(() => caches.match(e.request, {cacheName: MAP_CACHE})));
   } else if (STATIC_HOSTS.includes(url.hostname)) {
-    // Bibliothèques à version figée (fond vectoriel, détecteur d'obstacles) : la copie gardée d'abord
-    e.respondWith(caches.match(e.request, {cacheName: MAP_CACHE}).then(hit => hit || fetch(e.request).then(res => {
+    // Bibliothèques à version figée (fond vectoriel, détecteur d'obstacles, voix) : la copie gardée d'abord. Une copie
+    // « opaque » (gardée après un importScripts du détecteur) ne peut pas répondre à une demande CORS : le navigateur
+    // la refuse (« Failed to fetch » au téléchargement d'Hermès après un guidage, 25/10). Dans ce cas : le réseau, et
+    // la copie complète remplace l'opaque (elle convient aussi à l'importScripts).
+    const usable = hit => hit && !(hit.type === "opaque" && e.request.mode === "cors");
+    e.respondWith(caches.match(e.request, {cacheName: MAP_CACHE}).then(hit => usable(hit) ? hit : fetch(e.request).then(res => {
       if (res.ok || res.type === "opaque") keepMap(e.request, res.clone());
       return res;
     })));

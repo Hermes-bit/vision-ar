@@ -3,7 +3,8 @@
 // sur le téléphone par js/routing.js, copie fidèle du moteur du serveur.
 import {arOpen, closeAR, currentHeading, openAR} from "./ar.js";
 import {MODE, linesText, loadTransit, makeStreetFinder, searchPlaces, stopTarget, wheelText} from "./transit.js";
-import {clearSamples, exportZip, listSamples} from "./obstacles.js";
+import {clearSamples, exportZip, listSamples, removeSamples} from "./obstacles.js";
+import {deviceId, envoyer, setDeviceId} from "./upload.js";
 import {ZONES, zoneLabel} from "./zones.js";
 import {bindAuth, configureAuth, currentSession, isGuest, logout, resetForm, screenLogin, screenSignup, screenWelcome} from "./auth.js";
 import {icon} from "./icons.js";
@@ -15,7 +16,14 @@ import {entranceAccess, erpCategory} from "./categories.js";
 import {ORIGIN_RULES, decideOrigin, distM, originValid} from "./origin.js";
 import {labelPoints, minutes, walkingChoices} from "./compare.js";
 import {startCompass} from "./compass.js";
+import {SAMPLE_TEXT, VOICES, VOICE_DOWNLOAD_MB, makeVoiceEngine} from "./voices.js";
 import {computeRoutes, loadNetwork, nearestNode, RoutingError, SNAP_MAX_DISTANCE_M, haversineM, resolveProfile} from "./routing.js";
+import {alertesAutour, phraseAlerte} from "./nearby.js";
+
+// Adresse du serveur de collecte. Vide par défaut : aucun serveur n'est hébergé aujourd'hui
+// (PRODUCT.md § 7). Pour la régler sur un téléphone ou en local, depuis la console :
+//   localStorage.setItem("va-api-base", "http://localhost:8000")
+const apiBase = () => store.get("va-api-base", "");
 
 const MOB = [["manual_wheelchair", "Fauteuil roulant manuel", "accessibility"], ["electric_wheelchair", "Fauteuil électrique", "wheelchair-electric"],
   ["cane_or_walker", "Canne ou déambulateur", "cane"], ["low_vision", "Malvoyance", "eye-off"], ["hard_of_hearing", "Malentendance", "ear-off"]];
@@ -62,8 +70,8 @@ const saved = store.get("va-profile", null);
 const S = {
   screen: !currentSession() ? "welcome" : saved ? "route" : "profile",
   mobilities: new Set(saved?.mobilities || ["manual_wheelchair"]), maxSlope: saved?.maxSlope ?? null, steps: saved?.steps ?? false,
-  voice: store.get("va-voice", true), haptics: store.get("va-haptics", true), stopsVoice: store.get("va-stops-voice", false), detect: store.get("va-detect", true), detectDebug: store.get("va-detect-debug", false),
-  dataConsent: store.get("va-data-consent", false), autoLowConf: store.get("va-auto-lowconf", false), origin: PRESENTATION ? {...MAIRIE} : NO_ORIGIN(), dest: null, query: "", places: [],
+  voice: store.get("va-voice", true), voiceName: VOICES[store.get("va-voice-name", "")] ? store.get("va-voice-name", "") : "systeme", haptics: store.get("va-haptics", true), stopsVoice: store.get("va-stops-voice", false), detect: store.get("va-detect", true), detectDebug: store.get("va-detect-debug", false),
+  dataConsent: store.get("va-data-consent", false), autoLowConf: store.get("va-auto-lowconf", false), survey: store.get("va-survey", false), origin: PRESENTATION ? {...MAIRIE} : NO_ORIGIN(), dest: null, query: "", places: [],
   // départ : la position actuelle, demandée dès l'ouverture de la recherche ; searchFor « origin » quand on modifie
   // le départ (présentation : départ à la Mairie, la visite se fait de n'importe où, sans demande de localisation)
   originMode: PRESENTATION ? "manual" : "gps", originNeedsFix: !PRESENTATION, searchFor: "dest", oquery: "",
@@ -127,19 +135,90 @@ function addReport(kind, blocking, at) {
 // ---- Voix et vibrations ---------------------------------------------------------------
 // Annonces par ordre d'urgence (js/speech.js) : un danger coupe une info, une consigne attend la fin d'un
 // danger, rien n'est répété ni rattrapé en retard. `level` : DANGER, CONSIGNE, INFO (true = CONSIGNE, false = INFO).
+// Voix : Hermès ou Séléna (voix naturelles, js/voices.js) si elle est choisie et prête, sinon celle du téléphone.
+// Une alerte de danger ne doit jamais attendre : si la voix naturelle n'a pas commencé à parler en 0,7 s (phrase
+// pas encore calculée), la voix du téléphone la dit tout de suite.
+const voiceEngine = makeVoiceEngine();
+const voiceState = {};                                    // voix -> {downloaded, pct, error}
+function systemSpeak(text, fin) {
+  setTimeout(fin, 1500 + text.length * 90);              // filet : sur iPhone, la fin de lecture n'est pas toujours signalée
+  if (window.VisionARNative) { window.VisionARNative.speak(text, true); return; }   // appli Android : voix du téléphone
+  if (!("speechSynthesis" in window)) return fin();
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = "fr-FR"; u.onend = fin; u.onerror = fin;
+  speechSynthesis.speak(u);
+}
 const speech = makeSpeech({
-  speak(text, onEnd) {
-    let done = false;
+  speak(text, onEnd, level) {
+    let done = false, fellBack = false;
     const fin = () => { if (!done) { done = true; onEnd(); } };
-    setTimeout(fin, 1500 + text.length * 90);              // filet : sur iPhone, la fin de lecture n'est pas toujours signalée
-    if (window.VisionARNative) { window.VisionARNative.speak(text, true); return; }   // appli Android : voix du téléphone
-    if (!("speechSynthesis" in window)) return fin();
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = "fr-FR"; u.onend = fin; u.onerror = fin;
-    speechSynthesis.speak(u);
+    const key = S.voiceName, natural = VOICES[key] && voiceEngine.isReady(key) && !window.VisionARNative;
+    dispatchEvent(new CustomEvent("va-say", {detail: {text, voice: natural ? VOICES[key].name : "téléphone"}}));   // (téléphone virtuel)
+    if (!natural) return systemSpeak(text, fin);
+    const fallback = () => { if (done || fellBack) return; fellBack = true; job.cancel(); systemSpeak(text, fin); };
+    const job = voiceEngine.speak(key, text);
+    const safety = setTimeout(fin, 5000 + text.length * 120);   // filet : calcul + lecture
+    job.done.then(() => { clearTimeout(safety); if (!fellBack) fin(); }, () => { clearTimeout(safety); fallback(); });
+    if (level === DANGER) Promise.race([job.started.then(() => true), new Promise(r => setTimeout(r, 700, false))])
+      .then(ok => { if (!ok) fallback(); });
   },
-  cancel() { if (!window.VisionARNative) window.speechSynthesis?.cancel(); },
+  cancel() { voiceEngine.stop(); if (!window.VisionARNative) window.speechSynthesis?.cancel(); },
 });
+// Voix naturelle choisie et déjà téléchargée : préparée en arrière-plan au lancement (prête pour le guidage)
+function warmVoice() {
+  const key = S.voiceName;
+  if (!VOICES[key]) return;
+  voiceEngine.downloaded(key).then(d => {
+    voiceState[key] = {...voiceState[key], downloaded: d};
+    if (d) voiceEngine.prepare(key).then(() => updateVoiceRow(key)).catch(() => {});
+  });
+}
+setTimeout(warmVoice, 2500);
+function chooseVoice(key) {
+  S.voiceName = key;
+  store.set("va-voice-name", key);
+  if (VOICES[key] && !voiceEngine.isReady(key)) {
+    voiceState[key] = {pct: 0};
+    voiceEngine.prepare(key, pct => { voiceState[key] = {pct}; updateVoiceRow(key); })
+      .then(() => {
+        voiceState[key] = {downloaded: true};
+        if (S.voiceName === key) { toast(`${VOICES[key].name} est prêt : la voix marche maintenant sans internet.`); hearVoice(key); }
+        render();
+      })
+      .catch(e => { voiceState[key] = {error: e.message}; toast(`Téléchargement de la voix impossible (${e.message}). La voix du téléphone reste utilisée.`, 6000); render(); });
+  }
+  render();
+}
+function hearVoice(key) {
+  unlockVoice();
+  speech.clear?.();
+  if (key === "systeme") return systemSpeak(SAMPLE_TEXT, () => {});
+  if (voiceEngine.isReady(key)) return voiceEngine.speak(key, SAMPLE_TEXT);
+  voiceEngine.playSample(key).catch(() => {});             // pas encore téléchargée : échantillon enregistré
+}
+function voiceStatus(key) {
+  if (key === "systeme") return "voix de synthèse du téléphone, sans téléchargement";
+  const st = voiceState[key] || {};
+  if (voiceEngine.isReady(key) || st.downloaded) return "prête, marche sans internet";
+  if (st.pct != null) return `téléchargement… ${st.pct} %`;
+  if (st.error) return `échec du téléchargement (${st.error})`;
+  return `à télécharger une fois (${VOICE_DOWNLOAD_MB} Mo, Wi-Fi conseillé)`;
+}
+function updateVoiceRow(key) {
+  const el = $(`voiceSt-${key}`);
+  if (el) el.textContent = voiceStatus(key);
+}
+function voiceChoiceHtml() {
+  const opts = [...Object.entries(VOICES).map(([k, v]) => [k, v.name, v.desc]), ["systeme", "Voix du téléphone", ""]];
+  return `<div class="voice-pick" role="radiogroup" aria-label="Voix du guidage">${opts.map(([k, name, desc]) => {
+    const on = S.voiceName === k;
+    return `<div class="voice-row ${on ? "on" : ""}">
+      <button class="voice-main" role="radio" aria-checked="${on}" data-voice-pick="${k}"><span class="voice-dot">${on ? icon("check") : ""}</span>
+        <span class="grow"><b>${name}</b>${desc ? `<small>${desc}</small>` : ""}<small id="voiceSt-${k}">${voiceStatus(k)}</small></span></button>
+      <button class="btn soft small" data-voice-hear="${k}" aria-label="Écouter ${name}">${icon("volume-2")} Écouter</button></div>`;
+  }).join("")}</div>
+  <p class="fine">${icon("info")} Hermès : ${VOICES.hermes.credit}. Séléna : ${VOICES.selena.credit}. Moteur Piper, prononciation eSpeak NG.</p>`;
+}
 // iPhone : Safari ne parle qu'après une première lecture lancée PENDANT un appui de l'usager. Appelé dans
 // le geste « Démarrer le guidage » : une phrase vide et muette débloque la voix pour tout le trajet.
 function unlockVoice() {
@@ -151,6 +230,7 @@ function unlockVoice() {
     speechSynthesis.speak(u);
     speechSynthesis.getVoices();                          // charge la liste des voix (française) en avance
   } catch { /* pas de synthèse vocale : l'écran et les vibrations restent */ }
+  voiceEngine.unlock();                                   // voix naturelle (lecture audio) : débloquée dans le même geste
 }
 function say(text, level = false) {
   if (!S.voice) return;
@@ -563,7 +643,9 @@ function drawRoutes() {
     else L.polyline(ll, {color: C.route, weight: 6, opacity: 1, lineCap: "round", lineJoin: "round"}).addTo(layers.routes);
     // fin du trajet -> porte : pointillés, comme Google Maps
     const e = sel.geometry.at(-1);
-    if (S.dest && haversineM(e.lat, e.lon, S.dest.lat, S.dest.lon) > 12)
+    // Géométrie vide : départ et arrivée tombent sur le même nœud, on est déjà sur place.
+    // C'est un itinéraire légitime, mais il n'y a aucun point à relier (anomalie VA-012).
+    if (e && S.dest && haversineM(e.lat, e.lon, S.dest.lat, S.dest.lon) > 12)
       L.polyline([[e.lat, e.lon], [S.dest.lat, S.dest.lon]], {color: C.route, weight: 4, dashArray: "2 9", lineCap: "round", interactive: false}).addTo(layers.routes);
   }
   const underDot = S.origin.gps && liveFix && hereMarker && distM(S.origin, liveFix) < 12;
@@ -918,6 +1000,7 @@ function updateHereLink() {
   const r = S.screen === "route" && !S.nav ? S.routes[S.selected] : null;
   if (!r || !S.origin.gps || !liveFix || !hereMarker || Date.now() - liveFix.at > 15000) return;   // (départ choisi ailleurs : pas de lien)
   const g0 = r.geometry[0];
+  if (!g0) return;                 // déjà sur place : aucun point de départ à rejoindre (VA-012)
   if (haversineM(liveFix.lat, liveFix.lon, g0.lat, g0.lon) < 6 || haversineM(liveFix.lat, liveFix.lon, g0.lat, g0.lon) > 400) return;
   hereLink = L.polyline([[liveFix.lat, liveFix.lon], [g0.lat, g0.lon]], {color: C.route, weight: 4, dashArray: "2 9",
     lineCap: "round", interactive: false}).addTo(map);
@@ -1063,7 +1146,10 @@ function hazardsOn(n) {
       if (road && along - road.end < 3) road.len += len;
       else { road = {id: `e${id}-road`, along: at, len, ic: "triangle-alert"}; out.push(road); }
       road.end = along + len;
-      road.label = `Passage sur la chaussée, ${Math.max(5, Math.round(road.len / 5) * 5)} mètres`;
+      // L'étendue reste à part de la distance : « 160 mètres à 9 m » collait deux nombres
+      // sans rapport, illisible à l'écran comme à la voix (retour terrain du 14/11/2026).
+      road.label = "Passage sur la chaussée";
+      road.extent = Math.max(5, Math.round(road.len / 5) * 5);
     }
     // traversée sans feu sonore : annoncée seulement si c'est CONFIRMÉ (à Gennevilliers, 9 traversées sur 10 n'ont
     // pas l'information : les annoncer toutes saturerait l'usager ; le résumé avant le départ les compte)
@@ -1099,7 +1185,7 @@ function checkHazards() {
   hazardAlerted.add(h.id);
   const m = Math.max(1, Math.round(h.along - n.pos)), where = h.side ? `sur votre ${h.side}` : "devant vous";
   n.hazard = {...h, dist: m, where, at: Date.now()};       // bandeau à l'écran (malentendance : le repère principal)
-  say(`Attention, ${h.label.charAt(0).toLowerCase()}${h.label.slice(1)}, à ${m} mètre${m > 1 ? "s" : ""}, ${where}.`, DANGER);
+  say(`Attention, ${h.label.charAt(0).toLowerCase()}${h.label.slice(1)} dans ${m} mètre${m > 1 ? "s" : ""}, ${where}${h.extent ? `, sur ${h.extent} mètres` : ""}.`, DANGER);
   buzz("obstacle");
 }
 // Économie de batterie : loin du prochain virage et de tout obstacle, la vue caméra s'allège (moins d'images
@@ -1164,6 +1250,12 @@ function navState() {
 }
 function announce() {
   const n = S.nav, st = navState();
+  // voix Hermès / Séléna : la consigne du prochain virage est calculée dès le début de l'étape, pour partir sans
+  // délai au moment de tourner
+  if (n.prefetched !== st.idx && !st.arrived && S.voice && VOICES[S.voiceName]) {
+    n.prefetched = st.idx;
+    voiceEngine.prefetch(S.voiceName, st.next.text);
+  }
   if (st.arrived) {
     if (!n.said.has("arrive")) {
       n.said.add("arrive"); n.arrived = true;
@@ -1453,9 +1545,9 @@ function screenProfile() {
   <p class="fine">${icon("shield-check")} Démonstration : ${esc(zoneLabel(ZONE))}. Itinéraires calculés sur ce téléphone, aucune donnée personnelle envoyée.
     Réseau © OpenStreetMap (ODbL)${ZONE.france ? ", pentes © IGN" : ""}.</p>`;
 }
-const OPTION_KEYS = {detect: "va-detect", detectDebug: "va-detect-debug", dataConsent: "va-data-consent", autoLowConf: "va-auto-lowconf"};
+const OPTION_KEYS = {detect: "va-detect", detectDebug: "va-detect-debug", dataConsent: "va-data-consent", autoLowConf: "va-auto-lowconf", survey: "va-survey"};
 // ---- Paramètres : tout ce qui concerne l'appli, rangé au même endroit ----------------------------------
-const APP_VERSION = "97";
+const APP_VERSION = "101";
 function screenSettings() {
   const sess = currentSession(), mob = MOB.find(m => m[0] === primary());
   const row = (id, ic, label, value = "", chevron = true) => `<button class="set-row" id="${id}">${icon(ic)}<span class="grow">${label}</span>
@@ -1476,6 +1568,8 @@ function screenSettings() {
   </section>
   <section class="card stk-host">${sticker(S.voice ? "ca-vibre" : "lis-sans-son", "stk-card")}<h3>${icon("navigation")} Guidage</h3>
     ${sw("setVoice", "volume-2", "Consignes à la voix", S.voice)}
+    <h4 class="set-sub">${icon("user-round")} Voix du guidage</h4>
+    ${voiceChoiceHtml()}
     ${sw("setHaptics", "vibrate", "Vibrations de direction", S.haptics)}
     ${row("testHaptics", "vibrate", "Tester la vibration", "", false)}
     ${sw("setStopsVoice", "bus", "Annoncer les arrêts de transport proches", S.stopsVoice)}
@@ -1516,7 +1610,15 @@ function screenSettings() {
       d'une fausse alerte, avec la position et l'heure. Visages et plaques sont floutés avant tout enregistrement ; les images restent sur ce
       téléphone tant que vous ne les exportez pas. Vous pouvez retirer votre accord et tout effacer à tout moment.</p>
     ${S.dataConsent ? sw("setAutoLow", "scan-eye", "Enregistrer aussi les détections incertaines", S.autoLowConf) : ""}
+    ${S.dataConsent ? sw("setSurvey", "camera", "Relevé systématique (une image tous les 25 m)", S.survey) : ""}
+    ${S.dataConsent && S.survey ? `<p class="fine">${icon("info")} Le relevé prend beaucoup plus d'images : à réserver aux sorties de collecte, pas à l'usage courant.</p>` : ""}
     <div class="set-row static">${icon("database")}<span class="grow">Images collectées</span><span class="set-val" id="sampleCount">…</span></div>
+    ${apiBase() ? row("sendSamples", "arrow-up", "Envoyer au serveur", "", false) : ""}
+    ${apiBase() ? row("codeCollecte", "tags", "Code de collecteur", `${deviceId(store).slice(0, 8)}…`, false) : ""}
+    ${apiBase() ? row("codeReprendre", "users", "Utiliser le code d'un autre appareil", "", false) : ""}
+    ${apiBase() ? `<div class="set-row static">${icon("database")}<span class="grow">Envoyé avec ce code</span><span class="set-val" id="sentCount">…</span></div>` : ""}
+    <p class="fine" id="sendState" aria-live="polite">${apiBase() ? "" :
+      "Aucun serveur configuré : les images restent sur ce téléphone. L'export ZIP ci-dessous reste disponible."}</p>
     ${row("exportSamples", "share-2", "Exporter les images (ZIP)", "", false)}
     ${row("clearSamples", "trash-2", "Tout effacer", "", false)}
   </section>
@@ -1564,6 +1666,22 @@ function screenZones() {
   </section>`).join("")}
   <p class="fine">${icon("info")} D'autres villes et quartiers seront ajoutés au fur et à mesure de la collecte des données.</p>`;
 }
+// Autour de vous : ce qui gêne ou ce qui aide à moins de 300 m, selon le profil, avant même
+// d'avoir choisi une destination. La donnée vient du réseau, rien n'est inventé (js/nearby.js).
+function nearbyHtml() {
+  const p = herePoint();
+  if (!net || !p) return "";
+  const list = alertesAutour(net, p, {profil: resolveProfile(profileJson())});
+  if (!list.length) return "";
+  return `<section class="nearby">
+    <h3>${icon("locate-fixed")} Autour de vous</h3>
+    <ul>${list.map(a => `<li class="${a.genant ? "gene" : "aide"}">
+      <span class="nearby-ic" aria-hidden="true">${icon(a.icone)}</span>
+      <span class="sr-only">${esc(a.genant ? "Obstacle : " : "Utile : ")}${esc(phraseAlerte(a))}</span>
+      <span class="nearby-txt" aria-hidden="true"><b>${esc(a.label)}</b>${a.nom ? `<small>${esc(a.nom)}</small>` : ""}</span>
+      <span class="nearby-d" aria-hidden="true">${Math.round(a.distance / 5) * 5}&nbsp;m</span></li>`).join("")}</ul>
+  </section>`;
+}
 function screenRoute() {
   if (S.nav) return screenTripLive();                     // guidage réduit : son panneau, pas la recherche
   const chosen = S.routes[S.selected];
@@ -1597,6 +1715,7 @@ function screenRoute() {
       <li>Comparez les itinéraires&nbsp;: le plus accessible pour votre profil est proposé en premier.</li>
       <li>Touchez «&nbsp;Démarrer le guidage&nbsp;»&nbsp;: le trajet défile tout seul, avec la voix et les alertes.</li></ol>
     <button class="btn soft small" id="tourGo">${icon("navigation")} Essayer avec un exemple</button></section>` : ""}
+  ${!S.dest && S.searchFor === "dest" ? nearbyHtml() : ""}
   ${S.searchFor === "origin" ? "" : `
   ${S.dest ? `<div class="routes-head"><h3>${icon("route")} Choisissez votre itinéraire</h3>
     <button class="btn soft small fav-toggle ${currentFavIndex() >= 0 ? "on" : ""}" id="favToggle" aria-pressed="${currentFavIndex() >= 0}">
@@ -1761,7 +1880,7 @@ const navApi = {
   map,
   state: () => S.nav && {nav: S.nav, st: navState(), posAt, net, dest: S.dest, reports: reports(), speed: speed(),
     mobility: tripMobility(), voice: S.voice, theme: S.theme, haptics: S.haptics, hapticsNote: hapticsNote(),
-    detect: S.detect, detectDebug: S.detectDebug, dataConsent: S.dataConsent, autoLowConf: S.autoLowConf,
+    detect: S.detect, detectDebug: S.detectDebug, dataConsent: S.dataConsent, autoLowConf: S.autoLowConf, survey: S.survey,
     gpsInfo: S.nav.gpsInfo, gpsProblem: S.nav.gpsProblem, gpsDenied: S.nav.gpsDenied, gpsStatus: S.nav.gpsStatus,
     placesRange: S.placesRange, eco: ecoNow(), audioOnly: S.audioOnly, simulated: !!S.nav.simulated},
   reroute: () => manualReroute(),
@@ -2519,6 +2638,8 @@ function bind() {
   on("settingsBack", "onclick", () => go("route"));
   on("setProfile", "onclick", () => go("profile"));
   on("setVoice", "onchange", e => { S.voice = e.target.checked; store.set("va-voice", S.voice); });
+  all("[data-voice-pick]", b => b.onclick = () => chooseVoice(b.dataset.voicePick));
+  all("[data-voice-hear]", b => b.onclick = () => hearVoice(b.dataset.voiceHear));
   on("setHaptics", "onchange", e => { navApi.setHaptics(e.target.checked); render(); });
   on("setAlertDist", "oninput", e => { S.alertDist = +e.target.value; store.set("va-alert-dist", S.alertDist); $("alertDistLbl").textContent = `${S.alertDist} m`; });
   on("setPlacesRange", "oninput", e => { S.placesRange = +e.target.value; store.set("va-places-range", S.placesRange); $("placesRangeLbl").textContent = `${S.placesRange} m`; });
@@ -2537,8 +2658,9 @@ function bind() {
   on("setStopsVoice", "onchange", e => { S.stopsVoice = e.target.checked; store.set("va-stops-voice", S.stopsVoice); });
   on("setDetect", "onchange", e => navApi.setOption("detect", e.target.checked));
   on("setDetectDebug", "onchange", e => navApi.setOption("detectDebug", e.target.checked));
-  on("setConsent", "onchange", e => { navApi.setOption("dataConsent", e.target.checked); if (!e.target.checked) navApi.setOption("autoLowConf", false); render(); });
+  on("setConsent", "onchange", e => { navApi.setOption("dataConsent", e.target.checked); if (!e.target.checked) { navApi.setOption("autoLowConf", false); navApi.setOption("survey", false); } render(); });
   on("setAutoLow", "onchange", e => navApi.setOption("autoLowConf", e.target.checked));
+  on("setSurvey", "onchange", e => navApi.setOption("survey", e.target.checked));
   if ($("sampleCount")) listSamples().then(list => {
     const mb = list.reduce((t, x) => t + (x.blob?.size || 0), 0) / 1e6;
     if ($("sampleCount")) $("sampleCount").textContent = `${list.length} (${mb.toFixed(1).replace(".", ",")} Mo)`;
@@ -2549,6 +2671,53 @@ function bind() {
     const blob = await exportZip(), a = document.createElement("a");
     a.href = URL.createObjectURL(blob); a.download = `vision-ar-obstacles-${new Date().toISOString().slice(0, 10)}.zip`;
     document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  });
+  // Le code de collecteur regroupe les envois d'une même personne, sur plusieurs appareils.
+  // Ce n'est pas une identité : le serveur n'en garde qu'une empreinte (voir 002_signalements.sql).
+  on("codeCollecte", "onclick", async () => {
+    const code = deviceId(store);
+    try { await navigator.clipboard.writeText(code); toast("Code copié. Collez-le sur votre autre appareil.", 5000); }
+    catch { prompt("Copiez ce code, puis collez-le sur votre autre appareil :", code); }
+  });
+  on("codeReprendre", "onclick", () => {
+    const saisi = prompt("Collez le code de votre autre appareil : vos envois seront regroupés.", "");
+    if (saisi === null) return;
+    if (!setDeviceId(store, saisi)) return toast("Ce code ne convient pas : au moins 16 caractères, lettres, chiffres, « - » et « _ » seulement.", 7000);
+    toast("Code repris. Vos prochains envois rejoindront ceux de l'autre appareil.", 6000);
+    render();
+  });
+  if ($("sentCount")) {
+    fetch(`${apiBase().replace(/\/$/, "")}/samples/stats`, {headers: {"X-Device-Id": deviceId(store)}})
+      .then(r => r.ok ? r.json() : null)
+      .then(s => { if ($("sentCount")) $("sentCount").textContent = s ? `${s.mine ?? 0}` : "—"; })
+      .catch(() => { if ($("sentCount")) $("sentCount").textContent = "serveur injoignable"; });
+  }
+  on("sendSamples", "onclick", async () => {
+    const etat = $("sendState"), list = await listSamples();
+    if (!list.length) return toast("Aucune image collectée pour l'instant.");
+    if (etat) etat.textContent = `Envoi : 0 / ${list.length}…`;
+    let envoyes, refuses;
+    try {
+      ({envoyes, refuses} = await envoyer(list, {
+        url: `${apiBase().replace(/\/$/, "")}/samples`,
+        device: deviceId(store),
+        onProgress: (f, t) => { if (etat) etat.textContent = `Envoi : ${f} / ${t}…`; },
+      }));
+    } catch {
+      if (etat) etat.textContent = "Envoi impossible : pas de réseau. Les images sont conservées.";
+      return;
+    }
+    // Effacement séparé de l'envoi : s'il échoue, l'utilisateur doit savoir que ses images
+    // SONT arrivées — lui dire « pas de réseau » serait faux et l'inciterait à tout renvoyer.
+    try {
+      await removeSamples(envoyes);            // on n'efface QUE ce que le serveur a accusé
+    } catch {
+      if (etat) etat.textContent = `${envoyes.length} image(s) envoyée(s), mais l'effacement sur ce téléphone a échoué.`;
+      return;
+    }
+    if (etat) etat.textContent = `${envoyes.length} image(s) envoyée(s)` +
+      (refuses.length ? `, ${refuses.length} conservée(s) : ${refuses[0].raison}.` : ", espace libéré.");
+    render();
   });
   on("clearSamples", "onclick", async () => {
     if (!confirm("Effacer toutes les images collectées sur ce téléphone ?")) return;
@@ -2633,6 +2802,7 @@ fetch(ZONE.data).then(r => r.json()).then(data => {
 // Accès pour les tests automatiques uniquement (adresse terminée par ?debug)
 if (new URLSearchParams(location.search).has("debug"))
   window.__va = {S, posAt, navState, moveTo, chooseDest, get net() { return net; }, get transit() { return transit; }, addReport, reports, navApi,
+    voice: voiceEngine, chooseVoice: k => chooseVoice(k), say: (t, l) => say(t, l),
     useFavorite, stopGuidance, minimize: () => minimizeGuidance(), resume: () => resumeGuidance(), recenter: () => recenter(),
     heading: on => setHeadingMode(on), get follow() { return follow; }, get headingMode() { return headingMode; },
     get liveFix() { return liveFix; }, get geoPermission() { return geoPermission; },
